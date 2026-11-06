@@ -1,0 +1,939 @@
+//! Scheme-rs core runtime.
+//!
+//! The [`Runtime`] struct initializes and stores the core runtime for
+//! scheme-rs. It contains a registry of libraries and the memory associated
+//! with the JIT compiled [`Procedures`](Procedure).
+
+use crate::{
+    ast::{Definitions, Primitive},
+    cps::{
+        Cps,
+        codegen::{
+            JitContEntryFn, JitUserEntryFn, RuntimeFunctionsBuilder, codegen_jit_cont_entry_fn,
+            codegen_jit_user_entry_fn,
+        },
+        compile::Compiler,
+    },
+    env::{Environment, Global, TopLevelEnvironment},
+    exceptions::{Exception, SourceCache, raise},
+    gc::{Gc, Trace, init_gc},
+    hashtables::EqualHashSet,
+    lists::Pair,
+    num,
+    ports::{BufferMode, Port, Transcoder},
+    proc::{
+        Application, Args, ContBarrier, FuncPtr, ProcDebugInfo, Procedure, ProcedureInner,
+        ReturnAddress, UserPtr,
+    },
+    registry::Registry,
+    symbols::Symbol,
+    syntax::{Span, Syntax},
+    value::{Cell, TAG, UnpackedValue, Value},
+};
+use cranelift_jit::{ArenaMemoryProvider, JITModule};
+use parking_lot::{Mutex, MutexGuard, RwLock};
+use scheme_rs_macros::{maybe_async, maybe_await, runtime_fn};
+use std::{
+    collections::HashSet,
+    mem::{ManuallyDrop, MaybeUninit},
+    path::Path,
+    ptr::NonNull,
+    sync::{Arc, LazyLock},
+};
+
+/// Scheme-rs core runtime
+///
+/// Practically, the runtime is the core entry point for running Scheme programs
+/// with scheme-rs. It initializes the garbage collector and JIT compiler tasks
+/// and creates a new library registry.
+///
+/// There is not much you can do with a Runtime beyond creating it and using it
+/// to [run programs](Runtime::run_program), however a lot of functions require
+/// it as an arguments, such as [TopLevelEnvironment::new_repl].
+///
+/// You can also use the runtime to [define libraries](Runtime::def_lib) from
+/// Rust code.
+///
+/// There is only one Runtime per running program.
+///
+/// # Safety
+///
+/// The runtime contains the only live references to the Cranelift Context and
+/// therefore modules and allocated functions in the form a Sender of
+/// compilation tasks.
+///
+/// When that sender's ref count is zero, it will cause the receiver to fail and
+/// the compilation task will exit, allowing for a graceful shutdown.
+///
+/// However, this is dropping a lifetime. If we clone a procedure and drop the
+/// runtime from whence it was cleaved, we're left with a dangling pointer.
+///
+/// In order to remedy this we keep a Runtime alive for the lifetime of a
+/// program.
+#[derive(Trace, Copy, Clone)]
+pub struct Runtime(#[trace(skip)] pub(crate) &'static RuntimeInner);
+
+impl Default for Runtime {
+    fn default() -> Self {
+        Self::handle()
+    }
+}
+
+impl Runtime {
+    /// Creates a handle to the application's runtime, initializing the garbage
+    /// collector and creating a default registry with the bridge functions
+    /// populated.
+    pub fn handle() -> Self {
+        static APP_RUNTIME: LazyLock<RuntimeInner> = LazyLock::new(RuntimeInner::new);
+        Self(&APP_RUNTIME)
+    }
+
+    /// Run a program at the given location and return the values.
+    #[maybe_async]
+    pub fn run_program(self, path: &Path) -> Result<Vec<Value>, Exception> {
+        #[cfg(not(feature = "async"))]
+        use std::fs::File;
+
+        #[cfg(feature = "tokio")]
+        use tokio::fs::File;
+
+        let progm = TopLevelEnvironment::new_program(path);
+        let env = Environment::Top(progm.clone());
+
+        let mut form = {
+            let port = Port::new(
+                path.display(),
+                maybe_await!(File::open(path)).map_err(Exception::io_error)?,
+                BufferMode::Block,
+                Some(Transcoder::native()),
+            );
+            let file_name = path.file_name().unwrap().to_str().unwrap_or("<unknown>");
+            let span = Span::new(file_name);
+            maybe_await!(port.all_sexprs(span)).map_err(Exception::from)?
+        };
+
+        form.add_scope(progm.scope());
+
+        // Check if the first form is an import
+        let add_rnrs_import = if let Some(first_form) = form.car()
+            && let Some(Syntax::Identifier { ident, .. }) = first_form.car()
+            && let Some(binding) = ident.resolve()
+        {
+            env.lookup_primitive(binding) != Some(Primitive::Import)
+        } else {
+            true
+        };
+
+        // If the first form is not an import, import (rnrs)
+        if add_rnrs_import {
+            maybe_await!(env.import("(library (rnrs))".parse()?))?;
+        }
+
+        let mut mutable_vars = HashSet::default();
+        let body = maybe_await!(Definitions::parse_lib_body(&form, &env, &mut mutable_vars))?;
+        maybe_await!(Compiler::new(mutable_vars).compile(self, &body))
+    }
+
+    // TODO: Move to registry:
+
+    /// Define a library from Rust code. Useful if file system access is disabled.
+    #[cfg(not(feature = "async"))]
+    #[track_caller]
+    pub fn def_lib(&self, lib: &str) -> Result<(), Exception> {
+        use std::panic::Location;
+
+        self.get_registry().def_lib(lib, Location::caller().file())
+    }
+
+    /// Define a library from Rust code. Useful if file system access is disabled.
+    #[cfg(feature = "async")]
+    pub async fn def_lib(&self, lib: &str) -> Result<(), Exception> {
+        use std::panic::Location;
+
+        self.get_registry()
+            .def_lib(lib, Location::caller().file())
+            .await
+    }
+
+    pub(crate) fn get_registry(&self) -> Registry {
+        self.0.registry.clone()
+    }
+
+    #[maybe_async]
+    pub(crate) fn compile_expr(&self, expr: Cps) -> Result<Vec<Value>, Exception> {
+        let (completion_tx, completion_rx) = completion();
+        let task = CompilationTask {
+            completion_tx,
+            compilation_unit: expr,
+        };
+        let sender = { self.0.compilation_buffer_tx.clone() };
+        let _ = maybe_await!(sender.send(task));
+        let jit = maybe_await!(recv_continuation(completion_rx));
+        let mut barrier = ContBarrier::new();
+        let app = self.enter_jit_cont(jit, Args::empty(), &mut barrier);
+        maybe_await!(app.eval(&mut barrier))
+    }
+
+    pub(crate) fn enter_jit_cont(
+        &self,
+        jit: ReturnAddress,
+        args: Args,
+        barrier: &mut ContBarrier,
+    ) -> Application {
+        let mut out = MaybeUninit::uninit();
+        let Args([arg1, arg2, arg3, arg4, argn]) = args;
+        (self.0.jit_cont_entry_fn)(jit, arg1, arg2, arg3, arg4, argn, barrier, &mut out);
+        unsafe { out.assume_init() }
+    }
+
+    pub(crate) fn enter_jit_user(
+        &self,
+        jit: UserPtr,
+        proc: Procedure,
+        args: Args,
+        barrier: &mut ContBarrier,
+    ) -> Application {
+        let mut out = MaybeUninit::uninit();
+        let Args([arg1, arg2, arg3, arg4, argn]) = args;
+        (self.0.jit_user_entry_fn)(jit, proc, arg1, arg2, arg3, arg4, argn, barrier, &mut out);
+        unsafe { out.assume_init() }
+    }
+
+    pub fn source_cache(&self) -> MutexGuard<'_, SourceCache> {
+        self.0.source_cache.lock()
+    }
+}
+
+#[allow(unused)]
+#[cfg(not(feature = "async"))]
+fn read_to_string(path: &Path) -> std::io::Result<String> {
+    std::fs::read_to_string(path)
+}
+
+#[allow(unused)]
+#[cfg(feature = "tokio")]
+async fn read_to_string(path: &Path) -> std::io::Result<String> {
+    tokio::fs::read_to_string(path).await
+}
+
+#[cfg(not(feature = "async"))]
+type CompilationBufferTx = std::sync::mpsc::SyncSender<CompilationTask>;
+#[cfg(not(feature = "async"))]
+type CompilationBufferRx = std::sync::mpsc::Receiver<CompilationTask>;
+
+#[cfg(feature = "async")]
+type CompilationBufferTx = tokio::sync::mpsc::Sender<CompilationTask>;
+#[cfg(feature = "async")]
+type CompilationBufferRx = tokio::sync::mpsc::Receiver<CompilationTask>;
+
+pub(crate) struct RuntimeInner {
+    /// Package registry
+    pub(crate) registry: Registry,
+    /// Channel to compilation task
+    compilation_buffer_tx: CompilationBufferTx,
+    pub(crate) constants_pool: Mutex<EqualHashSet>,
+    pub(crate) globals_pool: Mutex<HashSet<Global>>,
+    pub(crate) source_cache: Mutex<SourceCache>,
+    /// Functions for jumping into JIT code
+    jit_cont_entry_fn: JitContEntryFn,
+    jit_user_entry_fn: JitUserEntryFn,
+}
+
+impl Default for RuntimeInner {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+const MAX_COMPILATION_TASKS: usize = 5; // Shrug
+
+#[cfg(not(feature = "async"))]
+fn compilation_buffer() -> (CompilationBufferTx, CompilationBufferRx) {
+    std::sync::mpsc::sync_channel(MAX_COMPILATION_TASKS)
+}
+
+#[cfg(feature = "async")]
+fn compilation_buffer() -> (CompilationBufferTx, CompilationBufferRx) {
+    tokio::sync::mpsc::channel(MAX_COMPILATION_TASKS)
+}
+
+impl RuntimeInner {
+    fn new() -> Self {
+        // Ensure the GC is initialized:
+        init_gc();
+
+        // Obtain the JIT entry functions:
+        let mut module = make_jit_module();
+        let jit_cont_entry_fn = codegen_jit_cont_entry_fn(&mut module);
+        let jit_user_entry_fn = codegen_jit_user_entry_fn(&mut module);
+
+        // Spawn the compilation task:
+        let (compilation_buffer_tx, compilation_buffer_rx) = compilation_buffer();
+        std::thread::spawn(move || compilation_task(module, compilation_buffer_rx));
+
+        RuntimeInner {
+            registry: Registry::new(),
+            compilation_buffer_tx,
+            constants_pool: Mutex::new(EqualHashSet::new()),
+            globals_pool: Mutex::new(HashSet::new()),
+            source_cache: Mutex::new(SourceCache::default()),
+            jit_cont_entry_fn,
+            jit_user_entry_fn,
+        }
+    }
+}
+
+#[derive(Trace, Clone, Debug, Default)]
+pub(crate) struct DebugInfo {
+    /// Stored user function debug information:
+    stored_func_info: Vec<Arc<ProcDebugInfo>>,
+}
+
+impl DebugInfo {
+    pub fn store_func_info(&mut self, debug_info: Arc<ProcDebugInfo>) {
+        self.stored_func_info.push(debug_info);
+    }
+}
+
+#[cfg(not(feature = "async"))]
+type CompletionTx = std::sync::mpsc::SyncSender<ReturnAddress>;
+#[cfg(not(feature = "async"))]
+type CompletionRx = std::sync::mpsc::Receiver<ReturnAddress>;
+
+#[cfg(feature = "async")]
+type CompletionTx = tokio::sync::oneshot::Sender<ReturnAddress>;
+#[cfg(feature = "async")]
+type CompletionRx = tokio::sync::oneshot::Receiver<ReturnAddress>;
+
+#[cfg(not(feature = "async"))]
+fn completion() -> (CompletionTx, CompletionRx) {
+    std::sync::mpsc::sync_channel(1)
+}
+
+#[cfg(feature = "async")]
+fn completion() -> (CompletionTx, CompletionRx) {
+    tokio::sync::oneshot::channel()
+}
+
+#[cfg(not(feature = "async"))]
+fn recv_continuation(rx: CompletionRx) -> ReturnAddress {
+    rx.recv().unwrap()
+}
+
+#[cfg(feature = "async")]
+async fn recv_continuation(rx: CompletionRx) -> ReturnAddress {
+    rx.await.unwrap()
+}
+
+struct CompilationTask {
+    compilation_unit: Cps,
+    completion_tx: CompletionTx,
+}
+
+#[cfg(not(feature = "async"))]
+fn recv_compilation_task(rx: &mut CompilationBufferRx) -> Option<CompilationTask> {
+    rx.recv().ok()
+}
+
+#[cfg(feature = "async")]
+fn recv_compilation_task(rx: &mut CompilationBufferRx) -> Option<CompilationTask> {
+    rx.blocking_recv()
+}
+
+fn make_jit_module() -> JITModule {
+    use cranelift::prelude::*;
+    use cranelift_jit::JITBuilder;
+
+    let mut flag_builder = settings::builder();
+
+    // Return addresses must be 16 byte aligned to be stored in values:
+    flag_builder
+        .set("log2_min_function_alignment", "4")
+        .unwrap();
+
+    // Cranelift's tail call implementation requires frame pointers:
+    flag_builder.set("preserve_frame_pointers", "true").unwrap();
+
+    let isa_builder = cranelift_native::builder().unwrap_or_else(|msg| {
+        panic!("host machine is not supported: {msg}");
+    });
+
+    let isa = isa_builder
+        .finish(settings::Flags::new(flag_builder))
+        .unwrap();
+
+    let mut jit_builder = JITBuilder::with_isa(isa, cranelift_module::default_libcall_names());
+
+    // Without giving the JIT a dedicated memory pool, the scheme-rs-gc can
+    // interrupt the contiguity of the JIT's memory, which can lead to a panic
+    // if two functions are more than 2GB apart.
+    const JIT_RESERVED_MEMORY: usize = 512 * 1024 * 1024;
+    jit_builder.memory_provider(Box::new(
+        ArenaMemoryProvider::new_with_size(JIT_RESERVED_MEMORY).unwrap(),
+    ));
+
+    for runtime_fn in inventory::iter::<RuntimeFn> {
+        (runtime_fn.install_symbol)(&mut jit_builder);
+    }
+
+    JITModule::new(jit_builder)
+}
+
+fn compilation_task(mut module: JITModule, mut compilation_queue_rx: CompilationBufferRx) {
+    let mut runtime_funcs_builder = RuntimeFunctionsBuilder::default();
+
+    for runtime_fn in inventory::iter::<RuntimeFn> {
+        (runtime_fn.install_decl)(&mut runtime_funcs_builder, &mut module);
+    }
+
+    let runtime_funcs = runtime_funcs_builder.build().unwrap();
+
+    // By storing all of the debug information in the same lifetime as the
+    // Context, we can directly put pointers referencing the debug information
+    // in our JIT compiled functions:
+    let mut debug_info = DebugInfo::default();
+
+    while let Some(task) = recv_compilation_task(&mut compilation_queue_rx) {
+        let CompilationTask {
+            completion_tx,
+            compilation_unit,
+        } = task;
+
+        let proc = compilation_unit.compile(&runtime_funcs, &mut module, &mut debug_info);
+
+        let _ = completion_tx.send(proc);
+    }
+
+    // Free the JITed memory
+    unsafe {
+        module.free_memory();
+    }
+}
+
+pub(crate) struct RuntimeFn {
+    install_decl:
+        for<'a> fn(&'a mut RuntimeFunctionsBuilder, module: &'a mut cranelift_jit::JITModule),
+    install_symbol: for<'a> fn(&'a mut cranelift_jit::JITBuilder),
+}
+
+impl RuntimeFn {
+    pub(crate) const fn new(
+        install_decl: for<'a> fn(
+            &'a mut RuntimeFunctionsBuilder,
+            module: &'a mut cranelift_jit::JITModule,
+        ),
+        install_symbol: for<'a> fn(&'a mut cranelift_jit::JITBuilder),
+    ) -> Self {
+        Self {
+            install_decl,
+            install_symbol,
+        }
+    }
+}
+
+inventory::collect!(RuntimeFn);
+
+unsafe fn arc_from_ptr<T>(ptr: *const T) -> Option<Arc<T>> {
+    unsafe {
+        if ptr.is_null() {
+            return None;
+        }
+        Arc::increment_strong_count(ptr);
+        Some(Arc::from_raw(ptr))
+    }
+}
+
+/// Allocate a new Gc with a value of undefined
+#[runtime_fn]
+unsafe extern "C" fn alloc_cell() -> *const () {
+    Value::into_raw(Cell(Gc::new(RwLock::new(Value::undefined()))).into_value())
+}
+
+/// Read the value of a Cell.
+#[runtime_fn]
+unsafe extern "C" fn read_cell(cell: *const ()) -> *const () {
+    unsafe {
+        let lock = &*((cell as usize & !TAG) as *const RwLock<Value>);
+        Value::into_raw(lock.read().clone())
+    }
+}
+
+/// Increment the reference count of a value, returning it
+#[runtime_fn]
+unsafe extern "C" fn clonev(val: *const ()) -> *const () {
+    unsafe { Value::into_raw(Value::from_raw_inc_rc(val)) }
+}
+
+/// Drop a value, decrementing its reference count
+#[runtime_fn]
+unsafe extern "C" fn dropv(val: *const ()) {
+    unsafe {
+        drop(Value::from_raw(val));
+    }
+}
+
+/// Create a boxed application.
+#[runtime_fn]
+unsafe extern "C" fn apply(
+    op: *const (),
+    arg1: *const (),
+    arg2: *const (),
+    arg3: *const (),
+    arg4: *const (),
+    argn: *const (),
+    barrier: *mut ContBarrier,
+    out: *mut MaybeUninit<Application>,
+) {
+    unsafe {
+        let args = Args([
+            Value::from_raw(arg1),
+            Value::from_raw(arg2),
+            Value::from_raw(arg3),
+            Value::from_raw(arg4),
+            Value::from_raw(argn),
+        ]);
+
+        let op = match Value::from_raw_inc_rc(op).unpack() {
+            UnpackedValue::Procedure(op) => op,
+            x => {
+                let raised = raise(
+                    Exception::invalid_operator(&x.type_name()).into(),
+                    barrier.as_mut().unwrap_unchecked(),
+                );
+                (*out).write(raised);
+                return;
+            }
+        };
+
+        (*out).write(Application::new(op, args));
+    }
+}
+
+/// Return a pointer to a cranelift ABI function that can be tail-called, or a
+/// null ptr if it cannot.
+#[runtime_fn]
+unsafe extern "C" fn tail_callable(op: *const ()) -> Option<NonNull<u8>> {
+    unsafe {
+        let op = ManuallyDrop::new(Value::from_raw(op));
+        if let UnpackedValue::Procedure(proc) = &*op.unpacked_ref()
+            && let FuncPtr::User(func) = proc.0.func
+        {
+            Some(func.0)
+        } else {
+            None
+        }
+    }
+}
+
+/// Borrow the environment pointer of a procedure value.
+#[runtime_fn]
+unsafe extern "C" fn proc_env(proc: *const ()) -> *const Value {
+    unsafe {
+        let proc = ManuallyDrop::new(Value::from_raw(proc));
+        let UnpackedValue::Procedure(proc) = &*proc.unpacked_ref() else {
+            unreachable!("proc_env called with a non-procedure");
+        };
+        proc.0.env.as_ptr()
+    }
+}
+
+/// Pop the top environment value off the call stack.
+#[runtime_fn]
+unsafe extern "C" fn pop_env(barrier: *mut ContBarrier) -> *const () {
+    unsafe { Value::into_raw(barrier.as_mut().unwrap_unchecked().pop_env()) }
+}
+
+/// Raise a wrong number of arguments exception and drop the arguments
+#[runtime_fn]
+unsafe extern "C" fn raise_wrong_num_args(
+    arg1: *const (),
+    arg2: *const (),
+    arg3: *const (),
+    arg4: *const (),
+    argn: *const (),
+    num_required: u32,
+    barrier: *mut ContBarrier,
+    out: *mut MaybeUninit<Application>,
+) {
+    unsafe {
+        let args = Args([
+            Value::from_raw(arg1),
+            Value::from_raw(arg2),
+            Value::from_raw(arg3),
+            Value::from_raw(arg4),
+            Value::from_raw(argn),
+        ]);
+        let provided = args.len();
+        (*out).write(raise(
+            Exception::wrong_num_of_args(num_required as usize, provided).into(),
+            barrier.as_mut().unwrap_unchecked(),
+        ));
+    }
+}
+
+/// Get a frame from a procedure and a span
+#[cfg(feature = "continuation-marks")]
+#[runtime_fn]
+unsafe extern "C" fn get_frame(op: *const (), span: *const ()) -> *const () {
+    unsafe {
+        use std::collections::BTreeSet;
+
+        use crate::{records::Embedded, syntax::Identifier};
+
+        let op = Value::from_raw_inc_rc(op);
+        let Some(op) = op.cast::<Procedure>() else {
+            return Value::into_raw(Value::null());
+        };
+        let span = Value::from_raw_inc_rc(span);
+        let span = span.cast::<Embedded<Span>>().unwrap();
+        let frame = Syntax::Identifier {
+            ident: Identifier {
+                sym: op
+                    .get_debug_info()
+                    .map_or_else(|| Symbol::intern("<lambda>"), |dbg| dbg.name),
+                scopes: BTreeSet::new(),
+            },
+            span: span.as_ref().clone(),
+        };
+        Value::into_raw(Value::from(frame))
+    }
+}
+
+/// Set the value for continuation mark
+#[cfg(feature = "continuation-marks")]
+#[runtime_fn]
+unsafe extern "C" fn set_continuation_mark(
+    _tag: *const (),
+    _val: *const (),
+    _barrier: *mut ContBarrier,
+) {
+    /*
+    unsafe {
+        let tag = Value::from_raw_inc_rc(tag);
+        let val = Value::from_raw_inc_rc(val);
+        barrier
+            .as_mut()
+            .unwrap()
+            .set_continuation_mark(tag.cast().unwrap(), val);
+    }
+     */
+}
+
+/// Create a boxed application that simply returns its arguments
+#[runtime_fn]
+pub(crate) unsafe extern "C" fn halt(args: *const (), out: *mut MaybeUninit<Application>) {
+    unsafe {
+        let args = ManuallyDrop::new(Value::from_raw(args));
+        (*out).write(Application::halt_ok(Args::from_list((*args).clone())));
+    }
+}
+
+/// Replace the value pointed to at to with the value contained in from.
+#[runtime_fn]
+unsafe extern "C" fn store(from: *const (), to: *const ()) {
+    unsafe {
+        // We do not need to increment the ref count for to, it is dropped
+        // immediately.
+        let from = Value::from_raw_inc_rc(from);
+        let to: ManuallyDrop<Cell> = ManuallyDrop::new(Value::from_raw(to).try_into().unwrap());
+        *to.0.write() = from;
+    }
+}
+
+/// Return the car of the argument
+#[runtime_fn]
+unsafe extern "C" fn car(val: *const (), error: *mut Value) -> *const () {
+    unsafe {
+        let val = ManuallyDrop::new(Value::from_raw(val));
+        if let Some(car) = val.pair_car() {
+            return Value::into_raw(car);
+        }
+        match val.try_to::<Pair>() {
+            Ok(pair) => Value::into_raw(pair.car()),
+            Err(condition) => {
+                error.write(condition.into());
+                Value::into_raw(Value::undefined())
+            }
+        }
+    }
+}
+
+/// Return the cdr of the argument
+#[runtime_fn]
+unsafe extern "C" fn cdr(val: *const (), error: *mut Value) -> *const () {
+    unsafe {
+        let val = ManuallyDrop::new(Value::from_raw(val));
+        if let Some(cdr) = val.pair_cdr() {
+            return Value::into_raw(cdr);
+        }
+        match val.try_to::<Pair>() {
+            Ok(pair) => Value::into_raw(pair.cdr()),
+            Err(condition) => {
+                error.write(condition.into());
+                Value::into_raw(Value::undefined())
+            }
+        }
+    }
+}
+
+/// Return the cons of the two arguments
+#[runtime_fn]
+unsafe extern "C" fn cons(car: *const (), cdr: *const ()) -> *const () {
+    unsafe {
+        let car = Value::from_raw_inc_rc(car);
+        let cdr = Value::from_raw_inc_rc(cdr);
+        Value::into_raw(Value::from(Pair::mutable(car, cdr)))
+    }
+}
+
+/// Return the arguments appended together as a list.
+#[runtime_fn]
+unsafe extern "C" fn append(vals: *const *const (), num_vals: u32, error: *mut Value) -> *const () {
+    unsafe fn append_raw(vals: *const *const (), num_vals: u32) -> Result<Value, Exception> {
+        unsafe {
+            if num_vals == 0 {
+                return Ok(Value::null());
+            }
+            let first = ManuallyDrop::new(Value::from_raw(vals.read()));
+            if num_vals == 1 {
+                return Ok((*first).clone());
+            }
+            crate::lists::append_list(&first, append_raw(vals.add(1), num_vals - 1)?)
+        }
+    }
+
+    match unsafe { append_raw(vals, num_vals) } {
+        Ok(lst) => Value::into_raw(lst),
+        Err(e) => unsafe {
+            error.write(e.into());
+            Value::into_raw(Value::undefined())
+        },
+    }
+}
+
+/// Return the proper list of the arguments
+#[runtime_fn]
+unsafe extern "C" fn list(vals: *const *const (), num_vals: u32) -> *const () {
+    let mut list = Value::null();
+    unsafe {
+        for i in (0..num_vals).rev() {
+            list = Value::from(Pair::mutable(
+                Value::from_raw_inc_rc(vals.add(i as usize).read()),
+                list,
+            ));
+        }
+    }
+    Value::into_raw(list)
+}
+
+/// Allocate a continuation
+#[runtime_fn]
+unsafe extern "C" fn push_continuation(
+    fn_ptr: NonNull<u8>,
+    env: *const *const (),
+    num_envs: u32,
+    barrier: *mut ContBarrier,
+) {
+    unsafe {
+        let barrier = barrier.as_mut().unwrap();
+        for i in 0..num_envs {
+            barrier
+                .call_stack
+                .push(Value::from_raw_inc_rc(env.add(i as usize).read()));
+        }
+        barrier.call_stack.push(Value::from(ReturnAddress(fn_ptr)));
+    }
+}
+
+/// Call the continuation at the top of the stack.
+#[runtime_fn]
+unsafe extern "C" fn call_continuation(
+    arg1: Value,
+    arg2: Value,
+    arg3: Value,
+    arg4: Value,
+    argn: Value,
+    barrier: *mut ContBarrier<'_>,
+    out: *mut MaybeUninit<Application>,
+) {
+    unsafe {
+        (*out).write(
+            barrier
+                .as_mut()
+                .unwrap()
+                .call_cont(Args([arg1, arg2, arg3, arg4, argn])),
+        );
+    }
+}
+
+/// Pop the JIT continuation at the top of the stack, returning null if none exists.
+#[runtime_fn]
+unsafe extern "C" fn pop_return_address(barrier: *mut ContBarrier) -> Option<ReturnAddress> {
+    unsafe { barrier.as_mut().unwrap().pop_return_address() }
+}
+
+/// Allocate a user function
+#[runtime_fn]
+unsafe extern "C" fn make_user(
+    fn_ptr: NonNull<u8>,
+    env: *const *const (),
+    num_envs: u32,
+    num_required_args: u32,
+    variadic: bool,
+    debug_info: *const ProcDebugInfo,
+) -> *const () {
+    unsafe {
+        // Collect the environment:
+        let env: Vec<_> = (0..num_envs)
+            .map(|i| Value::from_raw_inc_rc(env.add(i as usize).read()))
+            .collect();
+
+        let proc = Procedure(Gc::rooted(ProcedureInner::new(
+            env,
+            FuncPtr::User(UserPtr(fn_ptr)),
+            num_required_args as usize,
+            variadic,
+            arc_from_ptr(debug_info),
+        )));
+
+        Value::into_raw(Value::from(proc))
+    }
+}
+
+/// Path in a value into the env array for a procedure post-allocation. This
+/// isn't normally possible without Mutices, but procedures are allocated rooted
+/// and are unrooted after.
+#[runtime_fn]
+unsafe extern "C" fn patch_env_slot(proc: *const (), slot_idx: u32, value: *const ()) {
+    unsafe {
+        let proc_gc = ManuallyDrop::new(Gc::from_raw(
+            proc.map_addr(|raw| raw & !TAG) as *mut ProcedureInner
+        ));
+        (&mut *Gc::as_ptr(&proc_gc)).env[slot_idx as usize] = Value::from_raw_inc_rc(value);
+    }
+}
+
+/// Unroot a procedure, giving up mutable access
+#[runtime_fn]
+unsafe extern "C" fn unroot_proc(proc: *const ()) {
+    unsafe {
+        let proc_gc = ManuallyDrop::new(Gc::from_raw(
+            proc.map_addr(|raw| raw & !TAG) as *mut ProcedureInner
+        ));
+        Gc::unroot(&proc_gc);
+    }
+}
+
+/// Return an error in the case that a value is undefined
+#[runtime_fn]
+unsafe extern "C" fn error_unbound_variable(symbol: u32) -> *const () {
+    let sym = Symbol(symbol);
+    let condition = Exception::error(format!("undefined variable {sym}"));
+    Value::into_raw(Value::from(condition))
+}
+
+#[runtime_fn]
+unsafe extern "C" fn add(vals: *const *const (), num_vals: u32, error: *mut Value) -> *const () {
+    unsafe {
+        let vals: Vec<_> = (0..num_vals)
+            // Can't easily wrap these in a ManuallyDrop, so we dec the rc.
+            .map(|i| Value::from_raw_inc_rc(vals.add(i as usize).read()))
+            .collect();
+        match num::add_prim(vals) {
+            Ok(num) => Value::into_raw(Value::from(num)),
+            Err(condition) => {
+                error.write(condition.into());
+                Value::into_raw(Value::undefined())
+            }
+        }
+    }
+}
+
+#[runtime_fn]
+unsafe extern "C" fn sub(vals: *const *const (), num_vals: u32, error: *mut Value) -> *const () {
+    unsafe {
+        let vals: Vec<_> = (0..num_vals)
+            .map(|i| Value::from_raw_inc_rc(vals.add(i as usize).read()))
+            .collect();
+        match num::sub_prim(&vals[0], vals[1..].iter().cloned()) {
+            Ok(num) => Value::into_raw(Value::from(num)),
+            Err(condition) => {
+                error.write(condition.into());
+                Value::into_raw(Value::undefined())
+            }
+        }
+    }
+}
+
+#[runtime_fn]
+unsafe extern "C" fn i64_to_number(value: i64) -> *const () {
+    Value::into_raw(Value::from(num::Number::from(value)))
+}
+
+#[runtime_fn]
+unsafe extern "C" fn i128_to_number(lo: i64, hi: i64) -> *const () {
+    let value = ((hi as i128) << 64) | ((lo as u64) as i128);
+    Value::into_raw(Value::from(num::Number::from(value)))
+}
+
+#[runtime_fn]
+unsafe extern "C" fn mul(vals: *const *const (), num_vals: u32, error: *mut Value) -> *const () {
+    unsafe {
+        let vals: Vec<_> = (0..num_vals)
+            .map(|i| Value::from_raw_inc_rc(vals.add(i as usize).read()))
+            .collect();
+        match num::mul_prim(vals) {
+            Ok(num) => Value::into_raw(Value::from(num)),
+            Err(condition) => {
+                error.write(condition.into());
+                Value::into_raw(Value::undefined())
+            }
+        }
+    }
+}
+
+#[runtime_fn]
+unsafe extern "C" fn div(vals: *const *const (), num_vals: u32, error: *mut Value) -> *const () {
+    unsafe {
+        let vals: Vec<_> = (0..num_vals)
+            .map(|i| Value::from_raw_inc_rc(vals.add(i as usize).read()))
+            .collect();
+        match num::div_prim(&vals[0], vals[1..].iter().cloned()) {
+            Ok(num) => Value::into_raw(Value::from(num)),
+            Err(condition) => {
+                error.write(condition.into());
+                Value::into_raw(Value::undefined())
+            }
+        }
+    }
+}
+
+macro_rules! define_comparison_fn {
+    ( $name:ident, $prim:ident ) => {
+        #[runtime_fn]
+        unsafe extern "C" fn $name(
+            vals: *const *const (),
+            num_vals: u32,
+            error: *mut Value,
+        ) -> *const () {
+            unsafe {
+                let vals: Vec<_> = (0..num_vals)
+                    .map(|i| Value::from_raw_inc_rc(vals.add(i as usize).read()))
+                    .collect();
+                match num::$prim(vals) {
+                    Ok(res) => Value::into_raw(Value::from(res)),
+                    Err(condition) => {
+                        error.write(condition.into());
+                        Value::into_raw(Value::undefined())
+                    }
+                }
+            }
+        }
+    };
+}
+
+define_comparison_fn!(equal, equal_prim);
+define_comparison_fn!(greater, greater_prim);
+define_comparison_fn!(greater_equal, greater_equal_prim);
+define_comparison_fn!(lesser, lesser_prim);
+define_comparison_fn!(lesser_equal, lesser_equal_prim);

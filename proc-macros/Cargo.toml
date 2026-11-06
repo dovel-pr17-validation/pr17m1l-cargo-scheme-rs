@@ -1,0 +1,20 @@
+[package]
+name = "scheme-rs-macros"
+version = "0.2.0"
+edition = "2024"
+authors = ["Matthew Plant <maplant@protonmail.com>"]
+description = "Embedded scheme for the async-rust ecosystem (macros)"
+license = "MPL-2.0"
+
+documentation = "https://docs.rs/crate/scheme-rs"
+homepage = "https://github.com/maplant/scheme-rs"
+repository = "https://github.com/maplant/scheme-rs"
+
+[lib]
+proc-macro = true
+
+[dependencies]
+heck = "0.5"
+proc-macro2 = "1"
+quote = "1"
+syn = { version = "3", features = ["full"] }

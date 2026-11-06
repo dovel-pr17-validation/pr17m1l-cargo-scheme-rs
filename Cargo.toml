@@ -1,0 +1,87 @@
+[package]
+name = "scheme-rs"
+version = "0.2.0"
+edition = "2024"
+authors = ["Matthew Plant <maplant@protonmail.com>"]
+description = "Embedded scheme for the Rust ecosystem"
+license = "MPL-2.0"
+keywords = ["scheme", "JIT", "async", "scripting"]
+
+documentation = "https://docs.rs/crate/scheme-rs"
+homepage = "https://github.com/maplant/scheme-rs"
+repository = "https://github.com/maplant/scheme-rs"
+
+[dependencies]
+arc-swap = "1"
+by_address = "1.2"
+clap = { version = "4", features = ["derive"] }
+derive_builder = "0.20"
+futures = { version = "0.3", optional = true }
+hashbrown = "0.16.1"
+indexmap = "2"
+inventory = "0.3"
+lsp-server = { version = "0.7.9", optional = true }
+lsp-types = { version = "0.97.0", optional = true }
+malachite = { version = "0.9", features = ["floats"] }
+memchr = "2.7"
+num = "0.4"
+parking_lot = "0.12.5"
+rand = { version = "0.9", features = ["thread_rng"] }
+rust-embed = { version = "8", features = ["debug-embed"] }
+rustc-hash = "2.1"
+rustyline = { version = "17", features = ["derive"] }
+scheme-rs-gc = { version = "0.1.0", path = "scheme-rs-gc" }
+scheme-rs-macros = { version = "0.2.0", path = "proc-macros" }
+serde = { version = "1", features = ["derive"], optional = true }
+serde_json = { version = "1", optional = true }
+smallvec = "1"
+unicode_categories = "0.1"
+
+# TODO: Remove this dependency
+stacksafe = "1"
+
+# Cranelift dependencies
+cranelift = "0.135"
+cranelift-jit = "0.135"
+cranelift-native = "0.135"
+cranelift-module = "0.135"
+
+# Optional dependencies
+tokio = { version = "1.47", features = ["full"], optional = true }
+async-stream = { version = "0.3", optional = true }
+async-lock = { version = "3.4", optional = true }
+
+[features]
+default = ["load-libraries-from-fs"]
+async = ["dep:futures", "dep:async-stream", "dep:async-lock"]
+lsp = ["dep:lsp-server", "dep:lsp-types", "dep:serde", "dep:serde_json"]
+load-libraries-from-fs = []
+continuation-marks = []
+
+[profile.release]
+lto = true
+
+[build-dependencies]
+nom = "7"
+
+[dev-dependencies]
+criterion = { version = "0.5", features = ["html_reports", "async_tokio"] }
+
+[[bench]]
+name = "cold_boot"
+harness = false
+
+[[bench]]
+name = "fib"
+harness = false
+
+[[bench]]
+name = "integrate"
+harness = false
+
+[[bench]]
+name = "yin_yang"
+harness = false
+
+[workspace]
+members = ["proc-macros", "scheme-rs-gc"]

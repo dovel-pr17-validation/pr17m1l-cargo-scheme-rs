@@ -1,0 +1,1358 @@
+//! Scheme values.
+//!
+//! Scheme values are dynamic and can contain essentially any value, similar to
+//! an [`Arc<dyn Any>`](std::any::Any). Any type that has a valid scheme
+//! representation (see [scheme types](#scheme-types) for more information) can
+//! be converted easily to a Scheme `Value`. Converting a Rust primitive or
+//! standard library type can be done simply with the `From` trait:
+//!
+//! ```
+//! # use scheme_rs::value::Value;
+//! let value = Value::from(3.1415926f64);
+//! ```
+//!
+//! Converting a Value back to a concrete rust type can be done via the
+//! [`TryFrom`] trait or by obtaining an enum through the
+//! [`unpack`](Value::unpack) or [`unpacked_ref`](Value::unpacked_ref)
+//! functions:
+//!
+//! ```
+//! # use scheme_rs::value::{Value, UnpackedValue};
+//! # let value = Value::from(3.1415926f64);
+//! let float: f64 = value.clone().try_into().unwrap();
+//! let float: f64 = match value.unpack() {
+//!     UnpackedValue::Number(num) => num.try_into().unwrap(),
+//!     _ => unreachable!(),
+//! };
+//! ```
+//!
+//! It is generally preferrable to use `try_into` as opposed to `unpack` since
+//! `UnpackedValue` is an enumeration that is subject to change.
+//!
+//! Alternatively, the [`cast_to`](Value::cast_to)
+//! method can be used to obtain an Option from a reference for more ergonomic
+//! casting. There is also the [`try_to`](Value::try_to)
+//! function that is similarly more ergonomic:
+//!
+//! ```
+//! # use scheme_rs::value::{Value, UnpackedValue};
+//! let value = Value::from(3);
+//! let float = value.cast::<f64>().unwrap();
+//! let int = value.cast::<i64>().unwrap();
+//! ```
+//!
+//! ## Converting to and from arbitrary Rust types
+//!
+//! Besides primitives and standard library types, scheme-rs supports converting
+//! arbitrary Rust types (such as structs and enums) to `Values` by embedding
+//! them inside [`Records`](Record). To do this, the type must implement the
+//! [`Embeddable`](records::Embeddable) trait (see [`records`](scheme_rs::records)
+//! for more information).
+//!
+//! These conversions are performed with the standard conversion traits:
+//! - `Value::from(t)`: embed an [`Embeddable`](records::Embeddable) value into a
+//!   record, and then convert it to a `Value`.
+//! - [`try_to`](Value::try_to)`::<Embedded<T>>()`: attempt to convert the value
+//!   to an [`Embedded<T>`](records::Embedded), providing a detailed error on
+//!   failure.
+//! - [`cast_to`](Value::cast_to)`::<Embedded<T>>()`: attempt to convert the
+//!   value to an [`Embedded<T>`](records::Embedded), returning `None` on
+//!   failure.
+//!
+//! ## Scheme types
+//!
+//! Scheme values can inhabit at most one of any of the following types:
+//! - **Undefined**: Variables with this value throw an error upon being read.
+//! - **Null**: Can only be one possible value which is itself. Conceptually the
+//!   same as the [`()`](https://doc.rust-lang.org/std/primitive.unit.html) type.
+//! - **Pair**: A [collection of two Values](Pair). Conceptually similar to a
+//!   Rust [two-tuple](https://doc.rust-lang.org/std/primitive.tuple.html).
+//! - **Boolean**: Can either be `true` or `false`.
+//! - **Character**: A unicode code point. Same thing as a [`char`](std::char).
+//! - **Number**: A numerical value on the numerical tower. Represented by a
+//!   [`Number`](crate::num::Number).
+//! - **Symbol**: A [`Symbol`].
+//! - **Procedure**: A [`Procedure`].
+//! - **Record**: A [`Record`], which can possibly embed an
+//!   [`Embeddable`](records::Embeddable) Rust value.
+//! - **Record Type Descriptor**: A [descriptor of a record's type](RecordTypeDescriptor).
+//! - **Cell**: A mutable reference to another Value. This type is completely
+//!   transparent and impossible to observe.
+//!
+//! Any type that is not one of these can be stored in a Value, but they are
+//! considered to be [`Records`](records::Record).
+
+use indexmap::IndexSet;
+use malachite::Integer;
+use parking_lot::RwLock;
+
+use crate::{
+    exceptions::Exception,
+    gc::{Gc, HeapObject, Trace},
+    lists::{self, Pair, PairInner},
+    num::{ComplexNumber, Number, NumberInner, NumberRepr, SimpleNumber},
+    proc::{ContBarrier, Procedure, ProcedureInner, ReturnAddress},
+    records::{Embeddable, Embedded, Record, RecordInner, RecordTypeDescriptor},
+    registry::bridge,
+    symbols::Symbol,
+    syntax::Syntax,
+    vectors::VectorInner,
+};
+use std::{
+    collections::HashMap,
+    convert::Infallible,
+    hash::{Hash, Hasher},
+    marker::PhantomData,
+    mem::ManuallyDrop,
+    ops::Deref,
+    ptr::{NonNull, null},
+    sync::Arc,
+};
+
+const ALIGNMENT: usize = 16;
+pub(crate) const TAG_BITS: usize = ALIGNMENT.ilog2() as usize;
+pub(crate) const TAG: usize = 0b1111;
+pub(crate) const FALSE_VALUE: usize = 0x110000 << TAG_BITS | Tag::SmallValue as usize;
+pub(crate) const TRUE_VALUE: usize = 0x110001 << TAG_BITS | Tag::SmallValue as usize;
+pub(crate) const SYMBOL_CHAR: u32 = 0x110002;
+pub(crate) const NULL_VALUE: usize = Tag::Pair as usize;
+pub(crate) const UNDEFINED_VALUE: usize = Tag::Record as usize;
+pub const FIXNUM_MIN: i64 = -(1 << 62);
+pub const FIXNUM_MAX: i64 = (1 << 62) - 1;
+
+/// A Scheme value. See [the module documentation](scheme_rs::value) for more
+/// information.
+#[repr(transparent)]
+pub struct Value(*const ());
+
+impl Value {
+    /// Create a new `Value` from an `UnpackedValue`.
+    ///
+    /// This is generally discouraged as it's cumbersome; try using `From`
+    /// instead.
+    pub fn new(v: UnpackedValue) -> Self {
+        v.into_value()
+    }
+
+    /// #f is false, everything else is true
+    pub fn is_true(&self) -> bool {
+        self.0 as usize != FALSE_VALUE
+    }
+
+    pub fn is_null(&self) -> bool {
+        self.0 as usize == Tag::Pair as usize
+    }
+
+    pub fn is_undefined(&self) -> bool {
+        self.type_of() == ValueType::Undefined
+    }
+
+    /// Creates a new Value from a raw u64.
+    ///
+    /// # Safety
+    /// Calling this function is undefined behavior if the raw u64 was not obtained
+    /// via [into_raw](Value::into_raw)
+    pub unsafe fn from_raw(raw: *const ()) -> Self {
+        Self(raw)
+    }
+
+    /// Creates a new Value from a raw u64, incrementing the reference count.
+    ///
+    /// # Safety
+    /// Calling this function is undefined behavior if the raw u64 was not obtained
+    /// via [into_raw](Value::into_raw)
+    #[inline(always)]
+    pub unsafe fn from_raw_inc_rc(raw: *const ()) -> Self {
+        let tag = Tag::from(raw as usize & TAG);
+        let untagged = raw.map_addr(|raw| raw & !TAG);
+        unsafe {
+            match tag {
+                Tag::Number => Arc::increment_strong_count(untagged as *const NumberInner),
+                Tag::Procedure => Gc::increment_reference_count(untagged as *mut ProcedureInner),
+                Tag::Record => {
+                    if !untagged.is_null() {
+                        Gc::increment_reference_count(untagged as *mut RecordInner)
+                    }
+                }
+                Tag::RecordTypeDescriptor => {
+                    Arc::increment_strong_count(untagged as *const RecordTypeDescriptor)
+                }
+                Tag::Pair => {
+                    if !untagged.is_null() {
+                        Gc::increment_reference_count(untagged as *mut PairInner)
+                    }
+                }
+                Tag::Cell => {
+                    Gc::increment_reference_count(untagged as *mut Value);
+                }
+                Tag::ReturnAddress | Tag::FixNum | Tag::SmallValue => (),
+            }
+        }
+        Self(raw)
+    }
+
+    /// Creates a raw u64 from a Value. Does not decrement the reference count.
+    /// Calling this function without turning the raw value into a Value via
+    /// [from_raw](Value::from_raw) is equivalent to calling mem::forget on the
+    /// value.
+    pub fn into_raw(val: Self) -> *const () {
+        ManuallyDrop::new(val).0
+    }
+
+    /// Creates a raw u64 from the Value. Does not decrement the reference count.
+    pub fn as_raw(this: &Self) -> *const () {
+        this.0
+    }
+
+    fn from_ptr_and_tag<T: Send + Sync>(ptr: *const T, tag: Tag) -> Self {
+        Self(ptr.map_addr(|raw| raw | tag as usize) as *const ())
+    }
+
+    pub(crate) fn from_mut_ptr_and_tag<T: Send + Sync>(ptr: *mut T, tag: Tag) -> Self {
+        Self(ptr.map_addr(|raw| raw | tag as usize) as *const ())
+    }
+
+    pub fn undefined() -> Self {
+        Self(null::<()>().map_addr(|raw| raw | UNDEFINED_VALUE))
+    }
+
+    pub fn null() -> Self {
+        Self(null::<()>().map_addr(|raw| raw | NULL_VALUE))
+    }
+
+    /// Convert a [`Syntax`] into its corresponding datum representation.
+    pub fn datum_from_syntax(syntax: &Syntax) -> Self {
+        match syntax {
+            Syntax::Wrapped { value, .. } => value.clone(),
+            Syntax::List { list, .. } => {
+                let mut curr = Self::datum_from_syntax(list.last().unwrap());
+                for item in list[..list.len() - 1].iter().rev() {
+                    curr = Self::from(Pair::immutable(Self::datum_from_syntax(item), curr));
+                }
+                curr
+            }
+            Syntax::Vector { vector, .. } => Self::from(
+                vector
+                    .iter()
+                    .map(Self::datum_from_syntax)
+                    .collect::<Vec<_>>(),
+            ),
+            Syntax::Identifier { ident, .. } => Self::new(UnpackedValue::Symbol(ident.sym)),
+        }
+    }
+
+    pub fn type_of(&self) -> ValueType {
+        self.unpacked_ref().type_of()
+    }
+
+    pub fn type_name(&self) -> Arc<str> {
+        self.unpacked_ref().type_name()
+    }
+
+    /// Attempt to cast the value.
+    pub fn cast<T>(&self) -> Option<T>
+    where
+        for<'a> &'a Self: Into<Option<T>>,
+    {
+        self.into()
+    }
+
+    pub fn is_a<T>(&self) -> bool
+    where
+        for<'a> &'a Self: Into<Option<T>>,
+    {
+        // TODO: this needs to be improved dramatically.
+        self.into().is_some()
+    }
+
+    #[inline]
+    pub fn is_embedded<T: Embeddable>(&self) -> bool {
+        let tag = Tag::from(self.0 as usize & TAG);
+        if tag == Tag::Record
+            && let untagged = self.0.map_addr(|raw| raw & !TAG)
+            && !untagged.is_null()
+        {
+            let rec = ManuallyDrop::new(unsafe { Gc::from_raw(untagged as *mut RecordInner) });
+            // TODO: Optimize by checking that both types aren't sealed before
+            // checking the inherits list.
+            rec.rtd().is_subtype_of(&T::rtd())
+        } else {
+            false
+        }
+    }
+
+    /// Attempt to cast the value and return a descriptive error on failure.
+    pub fn try_to<T>(&self) -> Result<T, Exception>
+    where
+        T: for<'a> TryFrom<&'a Self, Error = Exception>,
+    {
+        self.try_into()
+    }
+
+    /// Unpack the value into an enum representation.
+    #[inline(always)]
+    pub fn unpack(self) -> UnpackedValue {
+        let raw = ManuallyDrop::new(self).0;
+
+        // Check for booleans:
+        if raw as usize == TRUE_VALUE {
+            return UnpackedValue::Boolean(true);
+        } else if raw as usize == FALSE_VALUE {
+            return UnpackedValue::Boolean(false);
+        }
+
+        let tag = Tag::from(raw as usize & TAG);
+        let untagged = raw.map_addr(|raw| raw & !TAG);
+        match tag {
+            Tag::SmallValue => {
+                let untagged_char = (untagged as usize as u32) >> TAG_BITS;
+                if untagged_char == SYMBOL_CHAR {
+                    // Upper 32 bits used for symbols
+                    UnpackedValue::Symbol(Symbol((untagged as usize >> 32) as u32))
+                } else {
+                    // Lower 32 bits used for character
+                    UnpackedValue::Character(char::from_u32(untagged_char).unwrap())
+                }
+            }
+            Tag::Number => {
+                let number = unsafe { Arc::from_raw(untagged as *const NumberInner) };
+                UnpackedValue::Number(Number(NumberRepr::Heap(number)))
+            }
+            Tag::Procedure => {
+                let clos = unsafe { Gc::from_raw(untagged as *mut ProcedureInner) };
+                UnpackedValue::Procedure(Procedure(clos))
+            }
+            Tag::Record if untagged.is_null() => UnpackedValue::Undefined,
+            Tag::Record => {
+                let rec = unsafe { Gc::from_raw(untagged as *mut RecordInner) };
+                UnpackedValue::Record(Record(rec))
+            }
+            Tag::RecordTypeDescriptor => {
+                let rt = unsafe { Arc::from_raw(untagged as *const RecordTypeDescriptor) };
+                UnpackedValue::RecordTypeDescriptor(rt)
+            }
+            Tag::Pair if untagged.is_null() => UnpackedValue::Null,
+            Tag::Pair => {
+                let pair = unsafe { Gc::from_raw(untagged as *mut PairInner) };
+                UnpackedValue::Pair(Pair(pair))
+            }
+            Tag::Cell => {
+                let cell = unsafe { Gc::from_raw(untagged as *mut RwLock<Value>) };
+                UnpackedValue::Cell(Cell(cell))
+            }
+            Tag::FixNum => UnpackedValue::Number(Number(NumberRepr::Fixed(raw as i64 >> 1))),
+            Tag::ReturnAddress => UnpackedValue::ReturnAddress(ReturnAddress(
+                NonNull::new(untagged as *mut u8).unwrap(),
+            )),
+        }
+    }
+
+    /// Construct a mutable cons cell from two values.
+    pub fn cons(car: impl Into<Value>, cdr: impl Into<Value>) -> Value {
+        UnpackedValue::Pair(Pair::mutable(car.into(), cdr.into())).into_value()
+    }
+
+    #[inline]
+    pub(crate) fn pair_car(&self) -> Option<Value> {
+        Some(self.borrow_pair()?.car.read().clone())
+    }
+
+    #[inline]
+    pub(crate) fn pair_cdr(&self) -> Option<Value> {
+        Some(self.borrow_pair()?.cdr.read().clone())
+    }
+
+    #[inline]
+    fn borrow_pair(&self) -> Option<ManuallyDrop<Gc<PairInner>>> {
+        if self.0 as usize & TAG != Tag::Pair as usize {
+            return None;
+        }
+        let untagged = self.0.map_addr(|raw| raw & !TAG);
+        if untagged.is_null() {
+            return None;
+        }
+        Some(ManuallyDrop::new(unsafe {
+            Gc::from_raw(untagged as *mut PairInner)
+        }))
+    }
+
+    pub fn unpacked_ref(&self) -> UnpackedValueRef<'_> {
+        let unpacked = ManuallyDrop::new(Value(self.0).unpack());
+        UnpackedValueRef {
+            unpacked,
+            marker: PhantomData,
+        }
+    }
+
+    /// The eq? predicate as defined by the R6RS specification.
+    #[allow(clippy::should_implement_trait)]
+    pub fn eq(&self, rhs: &Self) -> bool {
+        let obj1 = self.unpacked_ref();
+        let obj2 = rhs.unpacked_ref();
+        obj1.eq(&obj2)
+    }
+
+    /// The eqv? predicate as defined by the R6RS specification.
+    pub fn eqv(&self, rhs: &Self) -> bool {
+        let obj1 = self.unpacked_ref();
+        let obj2 = rhs.unpacked_ref();
+        obj1.eqv(&obj2)
+    }
+
+    /// The equal? predicate as defined by the R6RS specification.
+    pub fn equal(&self, rhs: &Self) -> bool {
+        equal(self, rhs)
+    }
+
+    /// Performs a hash suitable for use with eq? as an equivalance function
+    pub fn eq_hash<H: Hasher>(&self, state: &mut H) {
+        let unpacked = self.unpacked_ref();
+        std::mem::discriminant(&*unpacked).hash(state);
+        match &*unpacked {
+            UnpackedValue::Undefined => (),
+            UnpackedValue::Null => (),
+            UnpackedValue::ReturnAddress(_) => (),
+            UnpackedValue::Boolean(b) => b.hash(state),
+            UnpackedValue::Character(c) => c.hash(state),
+            UnpackedValue::Number(n) => n.eq_hash(state),
+            UnpackedValue::Symbol(s) => s.hash(state),
+            UnpackedValue::Procedure(c) => Gc::as_ptr(&c.0).hash(state),
+            UnpackedValue::Record(r) => r.eq_hash(state),
+            UnpackedValue::RecordTypeDescriptor(rt) => Arc::as_ptr(rt).hash(state),
+            UnpackedValue::Pair(p) => Gc::as_ptr(&p.0).hash(state),
+            UnpackedValue::Cell(c) => c.0.read().eqv_hash(state),
+        }
+    }
+
+    /// Performs a hash suitable for use with eqv? as an equivalance function
+    pub fn eqv_hash<H: Hasher>(&self, state: &mut H) {
+        let unpacked = self.unpacked_ref();
+        std::mem::discriminant(&*unpacked).hash(state);
+        match &*unpacked {
+            UnpackedValue::Undefined => (),
+            UnpackedValue::Null => (),
+            UnpackedValue::ReturnAddress(_) => (),
+            UnpackedValue::Boolean(b) => b.hash(state),
+            UnpackedValue::Character(c) => c.hash(state),
+            UnpackedValue::Number(n) => n.hash(state),
+            UnpackedValue::Symbol(s) => s.hash(state),
+            UnpackedValue::Procedure(c) => Gc::as_ptr(&c.0).hash(state),
+            UnpackedValue::Record(r) => r.eqv_hash(state),
+            UnpackedValue::RecordTypeDescriptor(rt) => Arc::as_ptr(rt).hash(state),
+            UnpackedValue::Pair(p) => Gc::as_ptr(&p.0).hash(state),
+            UnpackedValue::Cell(c) => c.0.read().eqv_hash(state),
+        }
+    }
+
+    /// Performs a hash suitable for use with equal? as an equivalance function
+    pub fn equal_hash<H: Hasher>(&self, recursive: &mut IndexSet<Value>, state: &mut H) {
+        let unpacked = self.unpacked_ref();
+        std::mem::discriminant(&*unpacked).hash(state);
+
+        // I think this is fine, because types that would be recursive will
+        // write out at least two values here where we're only writing out one.
+        if let Some(index) = recursive.get_index_of(self) {
+            state.write_usize(index);
+            return;
+        }
+
+        match &*unpacked {
+            UnpackedValue::Undefined => (),
+            UnpackedValue::Null => (),
+            UnpackedValue::ReturnAddress(_) => (),
+            UnpackedValue::Boolean(b) => b.hash(state),
+            UnpackedValue::Character(c) => c.hash(state),
+            UnpackedValue::Number(n) => n.hash(state),
+            UnpackedValue::Symbol(s) => s.hash(state),
+            UnpackedValue::Procedure(c) => Gc::as_ptr(&c.0).hash(state),
+            UnpackedValue::Record(r) => {
+                recursive.insert(self.clone());
+                r.equal_hash(recursive, state);
+            }
+            UnpackedValue::RecordTypeDescriptor(rt) => Arc::as_ptr(rt).hash(state),
+            UnpackedValue::Pair(p) => {
+                recursive.insert(self.clone());
+                let (car, cdr) = p.clone().into();
+                car.equal_hash(recursive, state);
+                cdr.equal_hash(recursive, state);
+            }
+            UnpackedValue::Cell(c) => c.0.read().eqv_hash(state),
+        }
+    }
+
+    pub fn read(&self) -> Self {
+        self.cast::<Cell>()
+            .map_or_else(|| self.clone(), |cell| cell.get())
+    }
+}
+
+impl Clone for Value {
+    fn clone(&self) -> Self {
+        unsafe { Self::from_raw_inc_rc(self.0) }
+    }
+}
+
+impl Drop for Value {
+    #[inline]
+    fn drop(&mut self) {
+        // TODO: Add decrement function to Gc and use that instead
+        let raw = self.0;
+        let tag = Tag::from(raw as usize & TAG);
+        let untagged = raw.map_addr(|raw| raw & !TAG);
+        unsafe {
+            match tag {
+                Tag::Number => drop(Arc::from_raw(untagged as *const NumberInner)),
+                Tag::Procedure => drop(Gc::from_raw(untagged as *mut ProcedureInner)),
+                Tag::Record => {
+                    if !untagged.is_null() {
+                        drop(Gc::from_raw(untagged as *mut RecordInner));
+                    }
+                }
+                Tag::RecordTypeDescriptor => {
+                    drop(Arc::from_raw(untagged as *const RecordTypeDescriptor));
+                }
+                Tag::Pair => {
+                    if !untagged.is_null() {
+                        drop(Gc::from_raw(untagged as *mut PairInner));
+                    }
+                }
+                Tag::Cell => drop(Gc::from_raw(untagged as *mut RwLock<Value>)),
+                Tag::ReturnAddress | Tag::FixNum | Tag::SmallValue => (),
+            }
+        }
+    }
+}
+
+impl Default for Value {
+    fn default() -> Self {
+        Self::undefined()
+    }
+}
+
+/// Default Hash implementation for Value is [Value::eqv_hash]. This produces
+/// reasonable hash maps.
+impl Hash for Value {
+    fn hash<H: std::hash::Hasher>(&self, state: &mut H) {
+        self.eqv_hash(state)
+    }
+}
+
+/// Default PartialEq implementation for Value is [Value::eqv]. This allows us
+/// to implement [Eq].
+impl PartialEq for Value {
+    fn eq(&self, rhs: &Value) -> bool {
+        self.eqv(rhs)
+    }
+}
+
+/// Eq can be implemented reasonably for Value since (eqv? +nan.0 +nan.0) is
+/// true
+impl Eq for Value {}
+
+unsafe impl Send for Value {}
+unsafe impl Sync for Value {}
+
+unsafe impl Trace for Value {
+    unsafe fn visit_children(&self, visitor: &mut dyn FnMut(HeapObject)) {
+        unsafe {
+            self.unpacked_ref().visit_children(visitor);
+        }
+    }
+
+    unsafe fn finalize(&mut self) {
+        unsafe { ManuallyDrop::new(Self(self.0).unpack()).finalize() }
+    }
+}
+
+/// A Cell is a value that is mutable, essentially a variable.
+#[derive(Clone, Trace)]
+pub struct Cell(pub(crate) Gc<RwLock<Value>>);
+
+impl Cell {
+    pub fn new(val: Value) -> Self {
+        Self(Gc::new(RwLock::new(val)))
+    }
+
+    pub fn get(&self) -> Value {
+        self.0.read().clone()
+    }
+
+    pub fn set(&self, new_val: Value) {
+        *self.0.write() = new_val;
+    }
+
+    /// Constructs a value from the Cell. The resulting Value contains a
+    /// reference to the cell and sees all mutations.
+    pub fn into_value(self) -> Value {
+        UnpackedValue::Cell(self).into_value()
+    }
+}
+
+impl From<&Value> for Option<Cell> {
+    fn from(val: &Value) -> Option<Cell> {
+        match val.clone().unpack() {
+            UnpackedValue::Cell(cell) => Some(cell),
+            _ => None,
+        }
+    }
+}
+
+/// A reference to an [`UnpackedValue`]. Allows for unpacking a `Value` without
+/// cloning/modifying the reference count.
+pub struct UnpackedValueRef<'a> {
+    unpacked: ManuallyDrop<UnpackedValue>,
+    marker: PhantomData<&'a UnpackedValue>,
+}
+
+impl Deref for UnpackedValueRef<'_> {
+    type Target = UnpackedValue;
+
+    fn deref(&self) -> &Self::Target {
+        &self.unpacked
+    }
+}
+
+impl AsRef<UnpackedValue> for UnpackedValueRef<'_> {
+    fn as_ref(&self) -> &UnpackedValue {
+        &self.unpacked
+    }
+}
+
+impl<T> From<Option<T>> for Value
+where
+    Value: From<T>,
+    Value: From<bool>,
+{
+    // Probably not the best way to do this, but whatever
+    fn from(value: Option<T>) -> Self {
+        match value {
+            Some(t) => Self::from(t),
+            None => Self::from(false),
+        }
+    }
+}
+
+impl From<Exception> for Value {
+    fn from(value: Exception) -> Self {
+        value.0
+    }
+}
+
+#[repr(u64)]
+#[derive(Copy, Clone, Debug, PartialEq, Eq, Hash)]
+pub(crate) enum Tag {
+    FixNum = 1,
+    Pair = 0 << 1,
+    SmallValue = 1 << 1,
+    Number = 2 << 1,
+    Procedure = 3 << 1,
+    Record = 4 << 1,
+    RecordTypeDescriptor = 5 << 1,
+    Cell = 6 << 1,
+    ReturnAddress = 7 << 1,
+}
+
+// TODO: Make TryFrom with error
+impl From<usize> for Tag {
+    #[inline(always)]
+    fn from(tag: usize) -> Self {
+        if tag & 1 == 1 {
+            Self::FixNum
+        } else if tag == Self::Pair as usize {
+            Self::Pair
+        } else if tag == Self::SmallValue as usize {
+            Self::SmallValue
+        } else if tag == Self::Number as usize {
+            Self::Number
+        } else if tag == Self::Procedure as usize {
+            Self::Procedure
+        } else if tag == Self::Record as usize {
+            Self::Record
+        } else if tag == Self::RecordTypeDescriptor as usize {
+            Self::RecordTypeDescriptor
+        } else if tag == Self::Cell as usize {
+            Self::Cell
+        } else if tag == Self::ReturnAddress as usize {
+            Self::ReturnAddress
+        } else {
+            panic!("Invalid tag: {tag}")
+        }
+    }
+}
+
+/// Different possible types that a Value can inhabit.
+#[derive(Copy, Clone, Debug, PartialEq, Eq, Hash)]
+pub enum ValueType {
+    Undefined,
+    Null,
+    Boolean,
+    Pair,
+    Character,
+    Number,
+    Symbol,
+    Procedure,
+    Record,
+    RecordTypeDescriptor,
+}
+
+/// The external, unpacked, enumeration representation of a scheme value.
+///
+/// Values that are not potentially cyclical, such as syntax objects and byte
+/// vectors use Arcs as they are much less expensive than Gc types.
+#[non_exhaustive]
+#[derive(Trace, Clone)]
+pub enum UnpackedValue {
+    Undefined,
+    Null,
+    Boolean(bool),
+    Character(char),
+    Number(Number),
+    Symbol(Symbol),
+    Procedure(Procedure),
+    Record(Record),
+    RecordTypeDescriptor(Arc<RecordTypeDescriptor>),
+    Pair(Pair),
+    Cell(Cell),
+    ReturnAddress(#[trace(skip)] ReturnAddress),
+}
+
+impl UnpackedValue {
+    pub fn into_value(self) -> Value {
+        match self {
+            Self::Undefined => Value::undefined(),
+            Self::Null => Value::null(),
+            Self::Boolean(false) => Value(FALSE_VALUE as *const ()),
+            Self::Boolean(true) => Value(TRUE_VALUE as *const ()),
+            Self::Character(c) => {
+                Value::from_ptr_and_tag(((c as usize) << TAG_BITS) as *const (), Tag::SmallValue)
+            }
+            Self::Number(num) => match num.0 {
+                NumberRepr::Heap(num) => {
+                    let untagged = Arc::into_raw(num);
+                    Value::from_ptr_and_tag(untagged, Tag::Number)
+                }
+                NumberRepr::Fixed(fixed) => {
+                    Value::from_ptr_and_tag((fixed << 1) as *const (), Tag::FixNum)
+                }
+            },
+            Self::Symbol(sym) => Value::from_ptr_and_tag(
+                (((sym.0 as usize) << 32) | (SYMBOL_CHAR as usize) << TAG_BITS) as *const (),
+                Tag::SmallValue,
+            ),
+            Self::Procedure(clos) => {
+                let untagged = Gc::into_raw(clos.0);
+                Value::from_mut_ptr_and_tag(untagged, Tag::Procedure)
+            }
+            Self::Record(rec) => {
+                let untagged = Gc::into_raw(rec.0);
+                Value::from_mut_ptr_and_tag(untagged, Tag::Record)
+            }
+            Self::RecordTypeDescriptor(rt) => {
+                let untagged = Arc::into_raw(rt);
+                Value::from_ptr_and_tag(untagged, Tag::RecordTypeDescriptor)
+            }
+            Self::Pair(pair) => {
+                let untagged = Gc::into_raw(pair.0);
+                Value::from_mut_ptr_and_tag(untagged, Tag::Pair)
+            }
+            Self::Cell(cell) => {
+                let untagged = Gc::into_raw(cell.0);
+                Value::from_mut_ptr_and_tag(untagged, Tag::Cell)
+            }
+            Self::ReturnAddress(ret) => {
+                Value::from_ptr_and_tag(ret.0.as_ptr() as *const u8, Tag::ReturnAddress)
+            }
+        }
+    }
+
+    #[allow(clippy::should_implement_trait)]
+    pub fn eq(&self, rhs: &Self) -> bool {
+        match (self, rhs) {
+            (Self::Boolean(a), Self::Boolean(b)) => a == b,
+            (Self::Symbol(a), Self::Symbol(b)) => a == b,
+            (Self::Number(a), Self::Number(b)) => a.eq(b),
+            (Self::Character(a), Self::Character(b)) => a == b,
+            (Self::Null, Self::Null) => true,
+            (Self::Pair(a), Self::Pair(b)) => Gc::ptr_eq(&a.0, &b.0),
+            (Self::Procedure(a), Self::Procedure(b)) => Gc::ptr_eq(&a.0, &b.0),
+            (Self::Record(a), Self::Record(b)) => a.eq(b),
+            (Self::RecordTypeDescriptor(a), Self::RecordTypeDescriptor(b)) => Arc::ptr_eq(a, b),
+            (Self::Cell(a), b) => a.0.read().unpacked_ref().eq(b),
+            (a, Self::Cell(b)) => a.eq(&b.0.read().unpacked_ref()),
+            _ => false,
+        }
+    }
+
+    pub fn eqv(&self, rhs: &Self) -> bool {
+        match (self, rhs) {
+            // Undefined is equivalent to undefined since it is impossible to
+            // read
+            (Self::Undefined, Self::Undefined) => true,
+            // boolean=?
+            (Self::Boolean(a), Self::Boolean(b)) => a == b,
+            // symbol=?
+            (Self::Symbol(a), Self::Symbol(b)) => a == b,
+            (Self::Number(a), Self::Number(b)) => a.eqv(b),
+            // char=?
+            (Self::Character(a), Self::Character(b)) => a == b,
+            // Both obj1 and obj2 are the empty list
+            (Self::Null, Self::Null) => true,
+            // Everything else is pointer equivalence
+            (Self::Pair(a), Self::Pair(b)) => Gc::ptr_eq(&a.0, &b.0),
+            (Self::Procedure(a), Self::Procedure(b)) => Gc::ptr_eq(&a.0, &b.0),
+            (Self::Record(a), Self::Record(b)) => a.eqv(b),
+            (Self::RecordTypeDescriptor(a), Self::RecordTypeDescriptor(b)) => Arc::ptr_eq(a, b),
+            (Self::Cell(a), b) => a.0.read().unpacked_ref().eqv(b),
+            (a, Self::Cell(b)) => a.eqv(&b.0.read().unpacked_ref()),
+            _ => false,
+        }
+    }
+
+    pub fn type_name(&self) -> Arc<str> {
+        match self {
+            Self::Undefined => Symbol::intern("undefined").to_str(),
+            Self::Boolean(_) => Symbol::intern("bool").to_str(),
+            Self::Number(_) => Symbol::intern("number").to_str(),
+            Self::Character(_) => Symbol::intern("character").to_str(),
+            Self::Symbol(_) => Symbol::intern("symbol").to_str(),
+            Self::Pair(_) | Self::Null => Symbol::intern("pair").to_str(),
+            Self::Procedure(_) => Symbol::intern("procedure").to_str(),
+            Self::Record(record) => record.rtd().name.to_str(),
+            Self::RecordTypeDescriptor(_) => Symbol::intern("rtd").to_str(),
+            Self::ReturnAddress(_) => Symbol::intern("%return-address").to_str(),
+            Self::Cell(cell) => cell.0.read().type_name(),
+        }
+    }
+
+    pub fn type_of(&self) -> ValueType {
+        match self {
+            Self::Undefined => ValueType::Undefined,
+            Self::Null => ValueType::Null,
+            Self::Boolean(_) => ValueType::Boolean,
+            Self::Number(_) => ValueType::Number,
+            Self::Character(_) => ValueType::Character,
+            Self::Symbol(_) => ValueType::Symbol,
+            Self::Pair(_) => ValueType::Pair,
+            Self::Procedure(_) | Self::ReturnAddress(_) => ValueType::Procedure,
+            Self::Record(_) => ValueType::Record,
+            Self::RecordTypeDescriptor(_) => ValueType::RecordTypeDescriptor,
+            Self::Cell(cell) => cell.0.read().type_of(),
+        }
+    }
+}
+
+/// Determine if two objects are equal in an extremely granular sense.
+///
+/// This implementation is a Rust translation of Efficient Dondestructive
+/// Equality Checking for Trees and Graphs by Michael D. Adams and R. Kent
+/// Dybvig.
+pub fn equal(obj1: &Value, obj2: &Value) -> bool {
+    interleave(&mut HashMap::default(), obj1, obj2, K0)
+}
+
+const K0: i64 = 400;
+const KB: i64 = -40;
+
+fn interleave(ht: &mut HashMap<Value, Value>, obj1: &Value, obj2: &Value, k: i64) -> bool {
+    e(ht, obj1, obj2, k).is_some()
+}
+
+fn e(ht: &mut HashMap<Value, Value>, obj1: &Value, obj2: &Value, k: i64) -> Option<i64> {
+    match k {
+        KB => fast(ht, obj1, obj2, rand::random_range(0..(K0 * 2))),
+        k if k <= 0 => slow(ht, obj1, obj2, k),
+        k => fast(ht, obj1, obj2, k),
+    }
+}
+
+fn fast(ht: &mut HashMap<Value, Value>, obj1: &Value, obj2: &Value, k: i64) -> Option<i64> {
+    let k = k - 1;
+    if obj1.eqv(obj2) {
+        return Some(k);
+    }
+    match (obj1.type_of(), obj2.type_of()) {
+        (ValueType::Pair, ValueType::Pair) => pair_eq(ht, obj1, obj2, k),
+        (ValueType::Record, ValueType::Record) => record_equal(ht, obj1.cast()?, obj2.cast()?, k),
+        _ => None,
+    }
+}
+
+fn slow(ht: &mut HashMap<Value, Value>, obj1: &Value, obj2: &Value, k: i64) -> Option<i64> {
+    if obj1.eqv(obj2) {
+        return Some(k);
+    }
+    match (obj1.type_of(), obj2.type_of()) {
+        (ValueType::Pair, ValueType::Pair) => {
+            if union_find(ht, obj1, obj2) {
+                return Some(0);
+            }
+            pair_eq(ht, obj1, obj2, k)
+        }
+        // (ValueType::ByteVector, ValueType::ByteVector) => bytevector_eq(obj1, obj2, k),
+        (ValueType::Record, ValueType::Record) => {
+            if union_find(ht, obj1, obj2) {
+                Some(0)
+            } else {
+                record_equal(ht, obj1.cast()?, obj2.cast()?, k)
+            }
+        }
+        _ => None,
+    }
+}
+
+fn pair_eq(ht: &mut HashMap<Value, Value>, obj1: &Value, obj2: &Value, k: i64) -> Option<i64> {
+    let obj1: Pair = obj1.clone().try_into().unwrap();
+    let obj2: Pair = obj2.clone().try_into().unwrap();
+    let (car_x, cdr_x) = obj1.into();
+    let (car_y, cdr_y) = obj2.into();
+    e(ht, &car_x, &car_y, k - 1).and_then(|k| e(ht, &cdr_x, &cdr_y, k))
+}
+
+fn vector_eq(
+    ht: &mut HashMap<Value, Value>,
+    vobj1: Embedded<VectorInner<Value>>,
+    vobj2: Embedded<VectorInner<Value>>,
+    k: i64,
+) -> Option<i64> {
+    let vobj1 = vobj1.vec.read();
+    let vobj2 = vobj2.vec.read();
+    if vobj1.len() != vobj2.len() {
+        return None;
+    }
+    let mut k = k - 1;
+    for (x, y) in vobj1.iter().zip(vobj2.iter()) {
+        k = e(ht, x, y, k)?;
+    }
+    Some(k)
+}
+
+fn record_equal(ht: &mut HashMap<Value, Value>, obj1: Record, obj2: Record, k: i64) -> Option<i64> {
+    if let Some(vobj1) = obj1.cast::<VectorInner<Value>>() {
+        obj2.cast::<VectorInner<Value>>()
+            .and_then(|vobj2| vector_eq(ht, vobj1, vobj2, k))
+    } else {
+        (obj1.equal(&obj2)).then_some(k)
+    }
+}
+
+fn union_find(ht: &mut HashMap<Value, Value>, x: &Value, y: &Value) -> bool {
+    let bx = ht.get(x).cloned();
+    let by = ht.get(y).cloned();
+    match (bx, by) {
+        (None, None) => {
+            let b = boxv(Value::from(Number::from(1)));
+            ht.insert(x.clone(), b.clone());
+            ht.insert(y.clone(), b);
+        }
+        (None, Some(by)) => {
+            let ry = find(by);
+            ht.insert(x.clone(), ry);
+        }
+        (Some(bx), None) => {
+            let rx = find(bx);
+            ht.insert(y.clone(), rx);
+        }
+        (Some(bx), Some(by)) => {
+            let rx = find(bx);
+            let ry = find(by);
+            if rx.eqv(&ry) {
+                return true;
+            }
+            let nx = unbox_to_num(&rx);
+            let ny = unbox_to_num(&ry);
+            if nx > ny {
+                set_box(&ry, rx.clone());
+                set_box(&rx, nx + ny);
+            } else {
+                set_box(&rx, ry.clone());
+                set_box(&ry, nx + ny);
+            }
+        }
+    }
+    false
+}
+
+fn find(mut b: Value) -> Value {
+    let mut n = unbox(&b);
+    if is_box(&n) {
+        loop {
+            let nn = unbox(&n);
+            if !is_box(&nn) {
+                return n;
+            }
+            set_box(&b, nn.clone());
+            b = n;
+            n = nn;
+        }
+    } else {
+        b
+    }
+}
+
+fn boxv(v: Value) -> Value {
+    Value::from(Pair::mutable(v.clone(), Value::null()))
+}
+
+fn unbox(v: &Value) -> Value {
+    let pair: Pair = v.clone().try_into().unwrap();
+    pair.car()
+}
+
+fn unbox_to_num(v: &Value) -> Number {
+    let pair: Pair = v.clone().try_into().unwrap();
+    pair.car().try_into().unwrap()
+}
+
+fn is_box(v: &Value) -> bool {
+    v.type_of() == ValueType::Pair
+}
+
+fn set_box(b: &Value, val: impl Into<Value>) {
+    let pair: Pair = b.clone().try_into().unwrap();
+    pair.set_car(val.into()).unwrap();
+}
+
+macro_rules! impl_try_from_value_for {
+    ($ty:ty, $variant:ident, $type_name:literal) => {
+        impl From<$ty> for UnpackedValue {
+            fn from(v: $ty) -> Self {
+                Self::$variant(v)
+            }
+        }
+
+        impl From<$ty> for Value {
+            fn from(v: $ty) -> Self {
+                UnpackedValue::from(v).into_value()
+            }
+        }
+
+        impl From<UnpackedValue> for Option<$ty> {
+            fn from(v: UnpackedValue) -> Self {
+                match v {
+                    UnpackedValue::$variant(v) => Some(v),
+                    _ => None,
+                }
+            }
+        }
+
+        impl From<Value> for Option<$ty> {
+            fn from(v: Value) -> Self {
+                v.unpack().into()
+            }
+        }
+
+        impl From<&'_ Value> for Option<$ty> {
+            fn from(v: &Value) -> Self {
+                v.clone().unpack().into()
+            }
+        }
+
+        impl TryFrom<UnpackedValue> for $ty {
+            type Error = Exception;
+
+            fn try_from(v: UnpackedValue) -> Result<Self, Self::Error> {
+                match v {
+                    UnpackedValue::$variant(v) => Ok(v),
+                    UnpackedValue::Cell(cell) => cell.0.read().clone().try_into(),
+                    e => Err(Exception::type_error($type_name, &*e.type_name())),
+                }
+            }
+        }
+
+        impl TryFrom<Value> for $ty {
+            type Error = Exception;
+
+            fn try_from(v: Value) -> Result<Self, Self::Error> {
+                v.unpack().try_into()
+            }
+        }
+
+        impl TryFrom<&Value> for $ty {
+            type Error = Exception;
+
+            fn try_from(v: &Value) -> Result<Self, Self::Error> {
+                v.clone().unpack().try_into()
+            }
+        }
+    };
+}
+
+impl From<Infallible> for Value {
+    fn from(value: Infallible) -> Self {
+        match value {}
+    }
+}
+
+impl TryFrom<&Value> for Value {
+    type Error = Exception;
+
+    fn try_from(v: &Value) -> Result<Self, Self::Error> {
+        Ok(v.clone())
+    }
+}
+
+impl TryFrom<UnpackedValue> for Cell {
+    type Error = Exception;
+
+    fn try_from(v: UnpackedValue) -> Result<Self, Self::Error> {
+        match v {
+            UnpackedValue::Cell(cell) => Ok(cell.clone()),
+            e => Err(Exception::type_error("cell", &e.type_name())),
+        }
+    }
+}
+
+impl TryFrom<Value> for Cell {
+    type Error = Exception;
+
+    fn try_from(v: Value) -> Result<Self, Self::Error> {
+        v.unpack().try_into()
+    }
+}
+
+impl TryFrom<&Value> for Cell {
+    type Error = Exception;
+
+    fn try_from(v: &Value) -> Result<Self, Self::Error> {
+        v.clone().unpack().try_into()
+    }
+}
+
+impl From<Value> for bool {
+    fn from(value: Value) -> Self {
+        value.is_true()
+    }
+}
+
+impl From<bool> for UnpackedValue {
+    fn from(value: bool) -> Self {
+        Self::Boolean(value)
+    }
+}
+
+impl From<bool> for Value {
+    fn from(value: bool) -> Self {
+        UnpackedValue::from(value).into_value()
+    }
+}
+
+impl_try_from_value_for!(char, Character, "char");
+impl_try_from_value_for!(Number, Number, "number");
+impl_try_from_value_for!(Symbol, Symbol, "symbol");
+impl_try_from_value_for!(Procedure, Procedure, "procedure");
+impl_try_from_value_for!(Pair, Pair, "pair");
+impl_try_from_value_for!(Record, Record, "record");
+impl_try_from_value_for!(ReturnAddress, ReturnAddress, "%return-address");
+impl_try_from_value_for!(Arc<RecordTypeDescriptor>, RecordTypeDescriptor, "rt");
+
+impl From<UnpackedValue> for Option<(Value, Value)> {
+    fn from(val: UnpackedValue) -> Self {
+        match val {
+            UnpackedValue::Pair(pair) => Some(pair.into()),
+            _ => None,
+        }
+    }
+}
+
+impl TryFrom<UnpackedValue> for (Value, Value) {
+    type Error = Exception;
+
+    fn try_from(val: UnpackedValue) -> Result<Self, Self::Error> {
+        match val {
+            UnpackedValue::Pair(pair) => Ok(pair.into()),
+            e => Err(Exception::type_error("pair", &e.type_name())),
+        }
+    }
+}
+
+macro_rules! impl_num_conversion {
+    ($ty:ty) => {
+        // TODO: Can we reverse these?
+        impl TryFrom<&Value> for $ty {
+            type Error = Exception;
+
+            fn try_from(value: &Value) -> Result<$ty, Self::Error> {
+                match &*value.unpacked_ref() {
+                    UnpackedValue::Number(num) => num.try_into(),
+                    e => Err(Exception::type_error("number", &e.type_name())),
+                }
+            }
+        }
+
+        impl TryFrom<Value> for $ty {
+            type Error = Exception;
+
+            fn try_from(value: Value) -> Result<$ty, Self::Error> {
+                (&value).try_into()
+            }
+        }
+
+        impl From<&Value> for Option<$ty> {
+            fn from(value: &Value) -> Self {
+                match &*value.unpacked_ref() {
+                    UnpackedValue::Number(num) => num.into(),
+                    _ => None,
+                }
+            }
+        }
+
+        impl From<Value> for Option<$ty> {
+            fn from(value: Value) -> Self {
+                match value.unpack() {
+                    UnpackedValue::Number(num) => num.into(),
+                    _ => None,
+                }
+            }
+        }
+
+        impl From<$ty> for Value {
+            fn from(n: $ty) -> Self {
+                Self::from(Number::from(n))
+            }
+        }
+    };
+}
+
+impl_num_conversion!(u8);
+impl_num_conversion!(u16);
+impl_num_conversion!(u32);
+impl_num_conversion!(u64);
+impl_num_conversion!(u128);
+impl_num_conversion!(usize);
+impl_num_conversion!(i8);
+impl_num_conversion!(i16);
+impl_num_conversion!(i32);
+impl_num_conversion!(i64);
+impl_num_conversion!(i128);
+impl_num_conversion!(isize);
+impl_num_conversion!(f64);
+impl_num_conversion!(Integer);
+impl_num_conversion!(SimpleNumber);
+impl_num_conversion!(ComplexNumber);
+
+impl From<Value> for Option<(Value, Value)> {
+    fn from(value: Value) -> Self {
+        value.unpack().into()
+    }
+}
+
+impl From<&Value> for Option<(Value, Value)> {
+    fn from(value: &Value) -> Self {
+        value.clone().unpack().into()
+    }
+}
+
+impl TryFrom<Value> for (Value, Value) {
+    type Error = Exception;
+
+    fn try_from(val: Value) -> Result<Self, Self::Error> {
+        Self::try_from(val.unpack())
+    }
+}
+
+impl TryFrom<&Value> for (Value, Value) {
+    type Error = Exception;
+
+    fn try_from(val: &Value) -> Result<Self, Self::Error> {
+        Self::try_from(val.clone().unpack())
+    }
+}
+
+/// Trait for converting vecs of values into arrays
+pub trait ExpectN<T> {
+    fn expect_n<const N: usize>(self) -> Result<[T; N], Exception>;
+}
+
+impl<T> ExpectN<T> for Vec<Value>
+where
+    Value: TryInto<T>,
+    Exception: From<<Value as TryInto<T>>::Error>,
+{
+    fn expect_n<const N: usize>(self) -> Result<[T; N], Exception> {
+        if self.len() != N {
+            return Err(Exception::error("wrong number of values"));
+        }
+        // Safety: we've already determined that self is the correct size, so we
+        // can safely use unwrap_unchecked
+        Ok(unsafe {
+            self.into_iter()
+                .map(Value::try_into)
+                .collect::<Result<Vec<_>, _>>()?
+                .try_into()
+                .unwrap_unchecked()
+        })
+    }
+}
+
+/// Trait for converting vecs of values into one type
+pub trait Expect1<T> {
+    fn expect1(self) -> Result<T, Exception>;
+}
+
+impl<T> Expect1<T> for Vec<Value>
+where
+    Value: TryInto<T>,
+    Exception: From<<Value as TryInto<T>>::Error>,
+{
+    fn expect1(self) -> Result<T, Exception> {
+        let [val] = self
+            .try_into()
+            .map_err(|_| Exception::error("wrong number of values"))?;
+        val.try_into().map_err(Exception::from)
+    }
+}
+
+#[bridge(name = "not", lib = "(rnrs base builtins (6))")]
+pub fn not(a: Value, _: &mut ContBarrier) -> bool {
+    a.0 as usize == FALSE_VALUE
+}
+
+#[bridge(name = "eq?", lib = "(rnrs base builtins (6))")]
+pub fn eq(a: Value, b: Value) -> bool {
+    a.eq(&b)
+}
+
+#[bridge(name = "eqv?", lib = "(rnrs base builtins (6))")]
+pub fn eqv(a: Value, b: Value) -> bool {
+    a.eqv(&b)
+}
+
+#[bridge(name = "equal?", lib = "(rnrs base builtins (6))")]
+pub fn equal_pred(a: Value, b: Value) -> bool {
+    a.equal(&b)
+}
+
+#[bridge(name = "boolean?", lib = "(rnrs base builtins (6))")]
+pub fn boolean_pred(arg: Value) -> bool {
+    arg.type_of() == ValueType::Boolean
+}
+
+#[bridge(name = "boolean=?", lib = "(rnrs base builtins (6))")]
+pub fn boolean_eq_pred(a: Value, #[rest_args] args: Value) -> bool {
+    a.type_of() == ValueType::Boolean && lists::iter_list(&args).all(|arg| arg == a)
+}
+
+#[bridge(name = "symbol?", lib = "(rnrs base builtins (6))")]
+pub fn symbol_pred(arg: Value) -> bool {
+    arg.type_of() == ValueType::Symbol
+}
+
+#[bridge(name = "char?", lib = "(rnrs base builtins (6))")]
+pub fn char_pred(arg: Value) -> bool {
+    arg.type_of() == ValueType::Character
+}
+
+#[bridge(name = "null?", lib = "(rnrs base builtins (6))")]
+pub fn null_pred(arg: Value, _: &mut ContBarrier) -> bool {
+    arg.type_of() == ValueType::Null
+}
+
+#[bridge(name = "pair?", lib = "(rnrs base builtins (6))")]
+pub fn pair_pred(arg: Value, _: &mut ContBarrier) -> bool {
+    arg.type_of() == ValueType::Pair
+}
+
+#[bridge(name = "procedure?", lib = "(rnrs base builtins (6))")]
+pub fn procedure_pred(arg: Value) -> bool {
+    arg.type_of() == ValueType::Procedure
+}

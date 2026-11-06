@@ -1,0 +1,1057 @@
+//! Exceptional situations and conditions.
+//!
+//! Scheme has two distinct concepts: conditions and exceptions. Exceptions are
+//! values that values passed to the `raise` and `raise-continuable` procedures
+//! and can be any [`Value`]. Conditions are records that contain information
+//! describing an erroneous situation or _condition_.
+//!
+//! Conditions in Scheme are either [simple](`SimpleCondition`) or
+//! [compound](`CompoundCondition`). Scheme-rs provides the ability to inspect
+//! conditions without discerning whether they or simple or compound. Using the
+//! [`condition`](Exception::condition) method, a specific condition and thus
+//! its associated information can be extracted from the condition.
+//!
+//! For example, a common condition is the [`&trace`](StackTrace) condition,
+//! which can be used to extract a stack trace for the exception:
+//!
+//! ```
+//! # use scheme_rs::{exceptions::{Exception, Message, SyntaxViolation, StackTrace}, records::Embedded, syntax::Syntax};
+//! // Code from scheme-rs repl to print errors:
+//! fn print_exception(exception: Exception) {
+//!     let Ok(conditions) = exception.simple_conditions() else {
+//!         println!(
+//!             "Exception occurred with a non-condition value: {:?}",
+//!             exception.0
+//!         );
+//!         return;
+//!     };
+//!     println!("Uncaught exception:");
+//!     for condition in conditions.into_iter() {
+//!         if let Some(message) = condition.cast::<Embedded<Message>>() {
+//!             println!(" - Message: {}", message.message);
+//!         } else if let Some(syntax) = condition.cast::<Embedded<SyntaxViolation>>() {
+//!             println!(" - Syntax error in form: {:?}", syntax.form);
+//!             if let Some(subform) = syntax.subform.as_ref() {
+//!                 println!("   (subform: {subform:?})");
+//!             }
+//!         } else if let Some(trace) = condition.cast::<Embedded<StackTrace>>() {
+//!             println!(" - Stack trace:");
+//!             for (i, trace) in trace.trace.iter().enumerate() {
+//!                 let syntax = trace.cast::<Embedded<Syntax>>().unwrap();
+//!                 let span = syntax.span();
+//!                 let func_name = syntax.as_ident().unwrap().symbol();
+//!                 println!("{:>6}: {func_name}:{span}", i + 1);
+//!             }
+//!         } else {
+//!             println!(" - Condition: {condition:?}");
+//!         }
+//!     }
+//! }
+//! ```
+#![allow(clippy::derivable_impls)]
+
+use crate::{
+    gc::Trace,
+    lists::{Pair, iter_list, slice_to_list},
+    ports::{IoDecodingError, IoEncodingError, IoError, IoReadError, IoWriteError},
+    proc::{Application, Args, ContBarrier, DynStackElem, FuncPtr, Procedure, Rest},
+    records::{Embeddable, Embedded, RecordTypeDescriptor},
+    registry::bridge,
+    runtime::Runtime,
+    syntax::{Identifier, Span, Syntax, parse::ParseSyntaxError},
+    value::{UnpackedValue, Value},
+    vectors::Vector,
+};
+use by_address::ByAddress;
+use scheme_rs_macros::runtime_fn;
+use std::{
+    collections::HashMap, convert::Infallible, fmt, mem::MaybeUninit, ops::Range, sync::Arc,
+};
+
+/// A macro for easily creating new condition types.
+pub use scheme_rs_macros::define_condition_type;
+
+impl fmt::Display for Exception {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let runtime = Runtime::handle();
+        self.pretty_print(&mut runtime.source_cache(), f)
+    }
+}
+
+impl fmt::Debug for Exception {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let runtime = Runtime::handle();
+        self.pretty_print(&mut runtime.source_cache(), f)
+    }
+}
+
+/// A signal of some sort of erroneous condition.
+#[derive(Clone, Trace)]
+pub struct Exception(pub Value);
+
+impl Exception {
+    pub fn error(message: impl fmt::Display) -> Self {
+        Self(Value::from(CompoundCondition::from((
+            Assertion::new(),
+            Message::new(message.to_string()),
+        ))))
+    }
+
+    pub fn syntax(form: Syntax, subform: Option<Syntax>) -> Self {
+        Self(Value::from(SyntaxViolation::new(form, subform)))
+    }
+
+    pub fn undefined(ident: Identifier) -> Self {
+        Self(Value::from(CompoundCondition::from((
+            Undefined::new(),
+            Message::new(format!("undefined variable {}", ident.sym)),
+        ))))
+    }
+
+    pub fn type_error(expected: &str, provided: &str) -> Self {
+        Self(Value::from(CompoundCondition::from((
+            Assertion::new(),
+            Message::new(format!(
+                "expected value of type {expected}, provided {provided}"
+            )),
+        ))))
+    }
+
+    pub fn invalid_operator(provided: &str) -> Self {
+        Self(Value::from(CompoundCondition::from((
+            Assertion::new(),
+            Message::new(format!(
+                "invalid operator: expected procedure, provided {provided}"
+            )),
+        ))))
+    }
+
+    pub fn invalid_index(index: usize, len: usize) -> Self {
+        Self(Value::from(CompoundCondition::from((
+            Assertion::new(),
+            Message::new(format!(
+                "index {index} out of bounds for collection of size {len}"
+            )),
+        ))))
+    }
+
+    pub fn invalid_range(range: Range<usize>, len: usize) -> Self {
+        Self(Value::from(CompoundCondition::from((
+            Assertion::new(),
+            Message::new(format!(
+                "range {range:?} out of bounds for collection of size {len}"
+            )),
+        ))))
+    }
+
+    pub fn wrong_num_of_unicode_chars(expected: usize, provided: usize) -> Self {
+        Self(Value::from(CompoundCondition::from((
+            Assertion::new(),
+            Message::new(format!(
+                "expected {expected} unicode characters from transform, received {provided}"
+            )),
+        ))))
+    }
+
+    pub fn wrong_num_of_args(expected: usize, provided: usize) -> Self {
+        Self(Value::from(CompoundCondition::from((
+            Assertion::new(),
+            Message::new(format!(
+                "expected {expected} arguments, provided {provided}"
+            )),
+        ))))
+    }
+
+    pub fn wrong_num_of_var_args(expected: Range<usize>, provided: usize) -> Self {
+        Self(Value::from(CompoundCondition::from((
+            Assertion::new(),
+            Message::new(format!(
+                "expected {} to {} arguments, provided {provided}",
+                expected.start, expected.end
+            )),
+        ))))
+    }
+
+    pub fn no_cont() -> Self {
+        Self(Value::from(CompoundCondition::from((
+            Assertion::new(),
+            Message::new("no continuation argument passed to this function"),
+        ))))
+    }
+
+    pub fn implementation_restriction(msg: impl fmt::Display) -> Self {
+        Self(Value::from(CompoundCondition::from((
+            Assertion::new(),
+            ImplementationRestriction::new(),
+            Message::new(msg),
+        ))))
+    }
+
+    /// For when we cannot convert a value into the requested type.
+    ///
+    /// Example: Integer to a Complex
+    pub fn conversion_error(expected: &str, provided: &str) -> Self {
+        Self(Value::from(CompoundCondition::from((
+            Assertion::new(),
+            Message::new(format!("cannot convert {provided} into {expected}")),
+        ))))
+    }
+
+    /// For when we cannot represent the value into the requested type.
+    ///
+    /// Example: an u128 number as an u8
+    pub fn not_representable(value: &str, r#type: &str) -> Self {
+        Self(Value::from(CompoundCondition::from((
+            Assertion::new(),
+            Message::new(format!("cannot represent '{value}' as {type}")),
+        ))))
+    }
+
+    pub fn io_error(message: impl fmt::Display) -> Self {
+        Self(Value::from(CompoundCondition::from((
+            IoError::new(),
+            Assertion::new(),
+            Message::new(message),
+        ))))
+    }
+
+    pub fn io_read_error(message: impl fmt::Display) -> Self {
+        Self(Value::from(CompoundCondition::from((
+            IoReadError::new(),
+            Assertion::new(),
+            Message::new(message),
+        ))))
+    }
+
+    pub fn io_write_error(message: impl fmt::Display) -> Self {
+        Self(Value::from(CompoundCondition::from((
+            IoWriteError::new(),
+            Assertion::new(),
+            Message::new(message),
+        ))))
+    }
+
+    pub fn io_decoding_error(message: impl fmt::Display, port: Value) -> Self {
+        Self(Value::from(CompoundCondition::from((
+            IoDecodingError::new(port),
+            Assertion::new(),
+            Message::new(message),
+        ))))
+    }
+
+    pub fn io_encoding_error(message: impl fmt::Display, port: Value, chr: char) -> Self {
+        Self(Value::from(CompoundCondition::from((
+            IoEncodingError::new(port, chr),
+            Assertion::new(),
+            Message::new(message),
+        ))))
+    }
+
+    pub fn invalid_record_index(k: usize) -> Self {
+        Self::error(format!("invalid record index: {k}"))
+    }
+
+    pub fn add_condition(self, condition: impl Embeddable) -> Self {
+        let mut conditions = if let Some(compound) = self.0.cast::<Embedded<CompoundCondition>>() {
+            compound.0.clone()
+        } else {
+            vec![self.0]
+        };
+
+        conditions.push(Value::from(condition));
+
+        Self(Value::from(CompoundCondition(conditions)))
+    }
+
+    pub fn simple_conditions(&self) -> Result<Vec<Value>, Exception> {
+        if self.0.cast::<Embedded<SimpleCondition>>().is_some() {
+            Ok(vec![self.0.clone()])
+        } else if let Some(compound_condition) = self.0.cast::<Embedded<CompoundCondition>>() {
+            Ok(compound_condition.0.clone())
+        } else {
+            Err(Exception::error("not a simple or compound condition"))
+        }
+    }
+
+    pub fn condition<T: Embeddable>(&self) -> Result<Option<Embedded<T>>, Exception> {
+        for condition in self.simple_conditions()?.into_iter() {
+            if let Some(condition) = condition.cast::<Embedded<T>>() {
+                return Ok(Some(condition));
+            }
+        }
+        Ok(None)
+    }
+
+    pub fn pretty_print(
+        &self,
+        source_cache: &mut SourceCache,
+        f: &mut impl fmt::Write,
+    ) -> fmt::Result {
+        let Ok(conditions) = self.simple_conditions() else {
+            return writeln!(
+                f,
+                "Exception occurred with a non-condition value: {:?}",
+                self.0
+            );
+        };
+
+        writeln!(f, "Uncaught exception:")?;
+        for condition in conditions.into_iter().rev() {
+            if let Some(message) = condition.cast::<Embedded<Message>>() {
+                writeln!(f, " - Message: {}", message.message)?;
+            } else if let Some(syntax) = condition.cast::<Embedded<SyntaxViolation>>() {
+                writeln!(f, " - Syntax error in form: {:?}", syntax.form)?;
+                source_cache.pretty_print_condition(syntax.as_ref(), f)?;
+            } else if let Some(trace) = condition.cast::<Embedded<StackTrace>>() {
+                if !trace.trace.is_empty() {
+                    writeln!(f, " - Trace:")?;
+                    source_cache.pretty_print_condition(trace.as_ref(), f)?;
+                }
+            } else if condition.cast::<Embedded<Assertion>>().is_some() {
+                writeln!(f, " - Assertion failed")?;
+            } else {
+                writeln!(f, " - Condition: {condition:?}")?;
+            }
+        }
+        Ok(())
+    }
+}
+
+impl From<&'_ Value> for Option<Exception> {
+    fn from(value: &'_ Value) -> Self {
+        if let UnpackedValue::Record(record) = &*value.unpacked_ref()
+            && let rtd = record.rtd()
+            && (RecordTypeDescriptor::is_subtype_of(&rtd, &SimpleCondition::rtd())
+                || RecordTypeDescriptor::is_subtype_of(&rtd, &CompoundCondition::rtd()))
+        {
+            Some(Exception(value.clone()))
+        } else {
+            None
+        }
+    }
+}
+
+impl From<std::io::Error> for Exception {
+    fn from(value: std::io::Error) -> Self {
+        Self::from((IoError::new(), Message::new(format!("{value:?}"))))
+    }
+}
+
+impl From<SimpleCondition> for Exception {
+    fn from(simple: SimpleCondition) -> Self {
+        Self(Value::from(simple))
+    }
+}
+
+impl From<Warning> for Exception {
+    fn from(warning: Warning) -> Self {
+        Self(Value::from(warning))
+    }
+}
+
+impl From<Serious> for Exception {
+    fn from(serious: Serious) -> Self {
+        Self(Value::from(serious))
+    }
+}
+
+impl From<Message> for Exception {
+    fn from(message: Message) -> Self {
+        Self(Value::from(message))
+    }
+}
+
+impl From<Infallible> for Exception {
+    fn from(infallible: Infallible) -> Self {
+        match infallible {}
+    }
+}
+
+impl From<ParseSyntaxError> for Exception {
+    fn from(error: ParseSyntaxError) -> Self {
+        Self::from((Lexical::new(), Message::new(error)))
+    }
+}
+
+macro_rules! impl_into_condition_for {
+    ($for:ty) => {
+        impl From<$for> for Exception {
+            fn from(e: $for) -> Self {
+                Self::error(e.to_string())
+            }
+        }
+    };
+}
+
+pub trait PrettyCondition {
+    fn span(&self) -> Span;
+
+    fn pretty_print(&self, _w: &mut impl fmt::Write) -> fmt::Result {
+        Ok(())
+    }
+}
+
+/// Pretty print a condition with source information, heavily inspired by
+/// [T8Err::render](https://github.com/xnacly/tango8/blob/master/shared/src/err.rs#L11)
+fn print_lines_with_offense_from_span(
+    span: &Span,
+    lines: Option<&[String]>,
+    w: &mut impl fmt::Write,
+) -> fmt::Result {
+    let Some(lines) = lines else {
+        return Ok(());
+    };
+
+    writeln!(w, "--> {}:{}:{}:", span.file, span.line, span.column)?;
+    let start = span.line.saturating_sub(2);
+    let end = (span.line + 3).min(lines.len() as u32);
+
+    for i in start..end {
+        //  <line num> | <line content>
+        //  +1, because 0 addressing
+        writeln!(w, "{:03} | {}", i + 1, lines[i as usize])?;
+        //  +1, because span.line is somehow not 0 addressed :O
+        if i + 1 == span.line {
+            writeln!(w, "    | {}~ here", " ".repeat(span.column))?; //  | <spacing until column>~
+        }
+    }
+    Ok(())
+}
+
+impl_into_condition_for!(std::num::TryFromIntError);
+
+#[derive(Copy, Clone, Default, Trace, Embeddable)]
+#[scheme(
+    lib = "(rnrs conditions (6))",
+    name = "&condition",
+    constructor = || Ok(SimpleCondition)
+)]
+pub struct SimpleCondition;
+
+impl SimpleCondition {
+    pub fn new() -> Self {
+        Self
+    }
+}
+
+#[bridge(name = "condition?", lib = "(rnrs conditions (6))")]
+pub fn condition_pred(obj: Value) -> bool {
+    obj.cast::<Embedded<SimpleCondition>>().is_some()
+        || obj.cast::<Embedded<CompoundCondition>>().is_some()
+}
+
+define_condition_type!(
+    lib: "(rnrs conditions (6))",
+    rust_name: Message,
+    scheme_name: "&message",
+    parent: SimpleCondition,
+    fields: {
+        message: String,
+    },
+    constructor: |message| {
+        Ok(Message { parent: SimpleCondition::new(), message: message.to_string() })
+    },
+);
+
+impl Message {
+    pub fn new(message: impl fmt::Display) -> Self {
+        Self {
+            parent: SimpleCondition::new(),
+            message: message.to_string(),
+        }
+    }
+}
+
+define_condition_type!(
+    lib: "(rnrs conditions (6))",
+    rust_name: Warning,
+    scheme_name: "&warning",
+    parent: SimpleCondition,
+);
+
+impl Warning {
+    pub fn new() -> Self {
+        Self {
+            parent: SimpleCondition::new(),
+        }
+    }
+}
+
+impl Default for Warning {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+define_condition_type!(
+    lib: "(rnrs conditions (6))",
+    rust_name: Serious,
+    scheme_name: "&serious",
+    parent: SimpleCondition,
+);
+
+impl Serious {
+    pub fn new() -> Self {
+        Self {
+            parent: SimpleCondition::new(),
+        }
+    }
+}
+
+impl Default for Serious {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+define_condition_type!(
+    lib: "(rnrs conditions (6))",
+    rust_name: StackTrace,
+    scheme_name: "&trace",
+    parent: SimpleCondition,
+    fields: {
+        trace: Vector,
+    },
+    constructor: |trace| {
+        Ok(StackTrace {
+            parent: SimpleCondition::new(),
+            trace: trace.clone().try_into()?,
+        })
+    },
+);
+
+impl PrettyCondition for StackTrace {
+    fn span(&self) -> Span {
+        let first = self.trace.first().unwrap();
+        let Some(syntax) = first.cast::<Embedded<Syntax>>() else {
+            return Span::default();
+        };
+        syntax.span().clone()
+    }
+
+    fn pretty_print(&self, w: &mut impl fmt::Write) -> fmt::Result {
+        for (i, trace) in self.trace.iter().enumerate() {
+            let Some(syntax) = trace.cast::<Embedded<Syntax>>() else {
+                continue;
+            };
+            let span = syntax.span();
+            let func_name = syntax.as_ident().unwrap().symbol();
+            writeln!(w, "{:>6}: {func_name}:{span}", i + 1)?;
+        }
+        Ok(())
+    }
+}
+
+impl StackTrace {
+    pub fn new(trace: Vec<Value>) -> Self {
+        Self {
+            parent: SimpleCondition::new(),
+            trace: Vector::from(trace),
+        }
+    }
+
+    pub fn trace(&self) -> Vec<Syntax> {
+        self.trace
+            .iter()
+            .filter_map(|v| v.cast::<Embedded<Syntax>>())
+            .map(|syntax| syntax.as_ref().clone())
+            .collect()
+    }
+}
+
+define_condition_type!(
+    lib: "(rnrs conditions (6))",
+    rust_name: Error,
+    scheme_name: "&error",
+    parent: Serious,
+);
+
+impl Error {
+    pub fn new() -> Self {
+        Self {
+            parent: Serious::new(),
+        }
+    }
+}
+
+impl Default for Error {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+define_condition_type!(
+    lib: "(rnrs conditions (6))",
+    rust_name: ImportError,
+    scheme_name: "&import",
+    parent: Error,
+    fields: {
+        library: String,
+    },
+    constructor: |lib| {
+        Ok(ImportError {  parent: Error::new(), library: lib.to_string() })
+    },
+);
+
+impl ImportError {
+    pub fn new(library: String) -> Self {
+        Self {
+            parent: Error::new(),
+            library,
+        }
+    }
+}
+
+define_condition_type!(
+    lib: "(rnrs conditions (6))",
+    rust_name: Violation,
+    scheme_name: "&violation",
+    parent: Serious,
+);
+
+impl Violation {
+    pub fn new() -> Self {
+        Self {
+            parent: Serious::new(),
+        }
+    }
+}
+
+impl Default for Violation {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+define_condition_type!(
+    lib: "(rnrs conditions (6))",
+    rust_name: Assertion,
+    scheme_name: "&assertion",
+    parent: Violation
+);
+
+impl Assertion {
+    pub fn new() -> Self {
+        Self {
+            parent: Violation::new(),
+        }
+    }
+}
+
+impl Default for Assertion {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+define_condition_type!(
+    lib: "(rnrs conditions (6))",
+    rust_name: Irritants,
+    scheme_name: "&irritants",
+    parent: SimpleCondition,
+    fields: {
+        irritants: Value,
+    },
+    constructor: |irritants| {
+        Ok(Irritants { parent: SimpleCondition::new(), irritants })
+    },
+);
+
+impl Irritants {
+    pub fn new(irritants: Value) -> Self {
+        Irritants {
+            parent: SimpleCondition::new(),
+            irritants,
+        }
+    }
+}
+
+define_condition_type!(
+    lib: "(rnrs conditions (6))",
+    rust_name: Who,
+    scheme_name: "&who",
+    parent: SimpleCondition,
+    fields: {
+        who: Value,
+    },
+    constructor: |who| {
+        Ok(Who { parent: SimpleCondition::new(), who, })
+    },
+);
+
+impl Who {
+    pub fn new(who: Value) -> Self {
+        Who {
+            parent: SimpleCondition::new(),
+            who,
+        }
+    }
+}
+
+define_condition_type!(
+    lib: "(rnrs conditions (6))",
+    rust_name: NonContinuable,
+    scheme_name: "&non-continuable",
+    parent: Violation,
+);
+
+impl Default for NonContinuable {
+    fn default() -> Self {
+        Self {
+            parent: Violation::new(),
+        }
+    }
+}
+
+define_condition_type!(
+    lib: "(rnrs conditions (6))",
+    rust_name: ImplementationRestriction,
+    scheme_name: "&implementation-restriction",
+    parent: Violation,
+);
+
+impl ImplementationRestriction {
+    pub fn new() -> Self {
+        Self::default()
+    }
+}
+
+impl Default for ImplementationRestriction {
+    fn default() -> Self {
+        Self {
+            parent: Violation::new(),
+        }
+    }
+}
+
+define_condition_type!(
+    lib: "(rnrs conditions (6))",
+    rust_name: Lexical,
+    scheme_name: "&lexical",
+    parent: Violation,
+);
+
+impl Lexical {
+    pub fn new() -> Self {
+        Self {
+            parent: Violation::new(),
+        }
+    }
+}
+
+impl Default for Lexical {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+define_condition_type!(
+    lib: "(rnrs conditions (6))",
+    rust_name: SyntaxViolation,
+    scheme_name: "&syntax",
+    parent: Violation,
+    fields: {
+        form: Value,
+        subform: Option<Value>,
+    },
+    constructor: |form, subform| {
+        let subform = if subform.is_true() { Some(subform) } else { None };
+        Ok(SyntaxViolation { parent: Violation::new(), form, subform })
+    },
+);
+
+impl PrettyCondition for SyntaxViolation {
+    fn span(&self) -> Span {
+        self.subform
+            .as_ref()
+            .unwrap_or(&self.form)
+            .cast::<Embedded<Syntax>>()
+            .unwrap()
+            .span()
+            .clone()
+    }
+}
+
+impl SyntaxViolation {
+    pub fn new(form: Syntax, subform: Option<Syntax>) -> Self {
+        Self {
+            parent: Violation::new(),
+            form: Value::from(form),
+            subform: subform.map(Value::from),
+        }
+    }
+
+    pub fn new_from_values(form: Value, subform: Option<Value>) -> Self {
+        Self {
+            parent: Violation::new(),
+            form,
+            subform,
+        }
+    }
+}
+
+define_condition_type!(
+    lib: "(rnrs conditions (6))",
+    rust_name: Undefined,
+    scheme_name: "&undefined",
+    parent: Violation
+);
+
+impl Undefined {
+    pub fn new() -> Self {
+        Self {
+            parent: Violation::new(),
+        }
+    }
+}
+
+impl Default for Undefined {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+#[derive(Clone, Trace, Embeddable)]
+#[scheme(
+    lib = "(rnrs conditions (6))",
+    name = "compound-condition",
+    sealed = true,
+    opaque = true
+)]
+pub struct CompoundCondition(pub(crate) Vec<Value>);
+
+impl fmt::Debug for CompoundCondition {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        for cond in self.0.iter() {
+            write!(f, " ")?;
+            cond.fmt(f)?;
+        }
+        Ok(())
+    }
+}
+
+impl<T> From<T> for Exception
+where
+    CompoundCondition: From<T>,
+{
+    fn from(value: T) -> Self {
+        Self(Value::from(CompoundCondition::from(value)))
+    }
+}
+
+impl<A, B> From<(A, B)> for CompoundCondition
+where
+    A: Embeddable,
+    B: Embeddable,
+{
+    fn from(value: (A, B)) -> Self {
+        Self(vec![Value::from(value.0), Value::from(value.1)])
+    }
+}
+
+impl<A, B, C> From<(A, B, C)> for CompoundCondition
+where
+    A: Embeddable,
+    B: Embeddable,
+    C: Embeddable,
+{
+    fn from(value: (A, B, C)) -> Self {
+        Self(vec![
+            Value::from(value.0),
+            Value::from(value.1),
+            Value::from(value.2),
+        ])
+    }
+}
+
+#[bridge(name = "condition", lib = "(rnrs conditions (6))")]
+pub fn condition(#[rest_args] conditions: Value) -> Result<Value, Exception> {
+    // TODO: Check if this is a condition
+    if let Some(pair) = conditions.cast::<Pair>()
+        && pair.cdr().is_null()
+    {
+        return Ok(pair.car());
+    }
+    Ok(Value::from(CompoundCondition(
+        iter_list(&conditions).collect(),
+    )))
+}
+
+#[bridge(name = "simple-conditions", lib = "(rnrs conditions (6))")]
+pub fn simple_conditions(condition: Value) -> Result<Value, Exception> {
+    Ok(slice_to_list(
+        &Exception(condition.clone()).simple_conditions()?,
+    ))
+}
+
+#[bridge(name = "with-exception-handler", lib = "(rnrs exceptions (6))")]
+pub fn with_exception_handler(
+    handler: Procedure,
+    thunk: Procedure,
+    barrier: &mut ContBarrier,
+) -> Application {
+    barrier.push_dyn_stack(DynStackElem::ExceptionHandler(handler));
+    thunk.call_with_cont(
+        Args::pack([]),
+        [],
+        |[]: [Value; 0], args: Rest, barrier: &mut ContBarrier| {
+            barrier.pop_dyn_stack();
+            barrier.call_cont(Args::from_list(args.0))
+        },
+        barrier,
+    )
+}
+
+#[doc(hidden)]
+#[bridge(name = "raise", lib = "(rnrs exceptions (6))")]
+pub fn raise_builtin(obj: Value, barrier: &mut ContBarrier) -> Application {
+    raise(obj.clone(), barrier)
+}
+
+/// Raises a non-continuable exception to the current exception handler.
+pub fn raise(raised: Value, barrier: &mut ContBarrier) -> Application {
+    /*
+    #[cfg(feature = "continuation-marks")]
+    let raised = if let Some(condition) = raised.cast::<Exception>() {
+        let trace = barrier.current_marks(crate::symbols::Symbol::intern("trace"));
+        Value::from(condition.add_condition(StackTrace::new(trace)))
+    } else {
+        raised
+    };
+    */
+
+    barrier.push_cont([raised], unwind_to_exception_handler);
+    barrier.call_cont(Args::pack([]))
+}
+
+#[runtime_fn]
+unsafe extern "C" fn raise_rt(
+    raised: *const (),
+    barrier: *mut ContBarrier,
+    out: *mut MaybeUninit<Application>,
+) {
+    unsafe {
+        let raised = Value::from_raw(raised);
+        (*out).write(raise(raised, barrier.as_mut().unwrap_unchecked()));
+    }
+}
+
+fn unwind_to_exception_handler(
+    env: [Value; 1],
+    _args: Rest,
+    barrier: &mut ContBarrier,
+) -> Application {
+    let [raised] = env;
+
+    loop {
+        return match barrier.pop_dyn_stack() {
+            None => {
+                // If the stack is empty, we should return the error
+                Application::halt_err(raised)
+            }
+            Some(DynStackElem::Winder(winder)) => {
+                // If this is a winder, we should call the out winder while
+                // unwinding.
+                barrier.push_cont([raised], unwind_to_exception_handler);
+                Application::new(winder.out_thunk, Args::pack([]))
+            }
+            Some(DynStackElem::ExceptionHandler(handler)) => {
+                barrier.push_cont([], reraise_exception);
+                Application::new(handler, Args::pack([raised]))
+            }
+            _ => continue,
+        };
+    }
+}
+
+fn reraise_exception(_env: [Value; 0], _args: Rest, _barrier: &mut ContBarrier) -> Application {
+    let exception = Value::from(NonContinuable::default());
+
+    Application::new(
+        Procedure::new(Vec::new(), FuncPtr::Bridge(raise_builtin), 1, false),
+        Args::pack([exception]),
+    )
+}
+
+/// Raises an exception to the current exception handler and continues with the
+/// value returned by the handler.
+#[doc(hidden)]
+#[bridge(name = "raise-continuable", lib = "(rnrs exceptions (6))")]
+pub fn raise_continuable(
+    condition: Value,
+    barrier: &mut ContBarrier,
+) -> Result<Application, Exception> {
+    let Some(handler) = barrier.current_exception_handler() else {
+        return Ok(Application::halt_err(condition.clone()));
+    };
+
+    Ok(Application::new(handler, Args::pack([condition.clone()])))
+}
+
+#[bridge(name = "error", lib = "(rnrs base builtins (6))")]
+pub fn error(who: Value, message: Value, #[rest_args] irritants: Value) -> Result<(), Exception> {
+    let mut conditions = Vec::new();
+    if who.is_true() {
+        conditions.push(Value::from(Who::new(who.clone())));
+    }
+    conditions.push(Value::from(Message::new(message)));
+    conditions.push(Value::from(Irritants::new(irritants)));
+    Err(Exception(Value::from(Exception::from(CompoundCondition(
+        conditions,
+    )))))
+}
+
+#[bridge(name = "assertion-violation", lib = "(rnrs base builtins (6))")]
+pub fn assertion_violation(
+    who: Value,
+    message: Value,
+    #[rest_args] irritants: Value,
+) -> Result<(), Exception> {
+    let mut conditions = Vec::new();
+    conditions.push(Value::from(Assertion::new()));
+    if who.is_true() {
+        conditions.push(Value::from(Who::new(who.clone())));
+    }
+    conditions.push(Value::from(Message::new(message)));
+    conditions.push(Value::from(Irritants::new(irritants)));
+    Err(Exception(Value::from(Exception::from(CompoundCondition(
+        conditions,
+    )))))
+}
+
+/// Store of source files for pretty printing error messages.
+#[derive(Default, Trace)]
+pub struct SourceCache {
+    cache: HashMap<ByAddress<Arc<str>>, Vec<String>>,
+}
+
+impl SourceCache {
+    pub fn store(&mut self, file_name: Arc<str>, lines: Vec<String>) {
+        self.cache.insert(ByAddress(file_name), lines);
+    }
+
+    pub fn fetch(&mut self, file_name: &Arc<str>) -> Option<&[String]> {
+        if !self.cache.contains_key(ByAddress::from_ref(file_name)) {
+            let lines = std::fs::read_to_string(file_name.as_ref())
+                .ok()?
+                .lines()
+                .map(|x| x.to_string())
+                .collect::<Vec<_>>();
+            self.cache.insert(ByAddress(file_name.clone()), lines);
+        }
+        self.cache
+            .get(ByAddress::from_ref(file_name))
+            .map(|lines| lines.as_ref())
+    }
+
+    pub fn pretty_print_condition(
+        &mut self,
+        pe: &impl PrettyCondition,
+        w: &mut impl fmt::Write,
+    ) -> fmt::Result {
+        let span = pe.span();
+        let lines = self.fetch(&span.file);
+        pe.pretty_print(w)?;
+        print_lines_with_offense_from_span(&span, lines, w)
+    }
+}

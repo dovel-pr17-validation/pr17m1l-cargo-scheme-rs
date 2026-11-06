@@ -1,0 +1,72 @@
+//! Threading primitives
+
+use std::{
+    thread::{self, ThreadId},
+    time::Duration,
+};
+
+use parking_lot::Mutex;
+use scheme_rs_macros::bridge;
+
+use crate::{
+    exceptions::Exception,
+    gc::{Gc, Trace},
+    proc::{Application, Args, ContBarrier, Procedure},
+    records::{Embeddable, Embedded},
+    value::Value,
+};
+
+#[derive(Trace, Embeddable)]
+#[scheme(name = "%join-handle", sealed = true, opaque = true)]
+pub struct JoinHandle {
+    #[trace(skip)]
+    id: ThreadId,
+    result: Gc<Mutex<Result<Vec<Value>, Exception>>>,
+}
+
+#[bridge(name = "spawn", lib = "(threads (1))")]
+pub fn spawn(thunk: Procedure) -> JoinHandle {
+    let cell = Gc::new(Mutex::new(Ok(Vec::new())));
+    let cell_cloned = cell.clone();
+    let join_handle = thread::spawn(move || {
+        let mut cell_write = cell_cloned.lock();
+
+        #[cfg(not(feature = "async"))]
+        {
+            *cell_write = thunk.call(&[], &mut ContBarrier::new());
+        }
+
+        #[cfg(feature = "async")]
+        {
+            *cell_write = thunk.call_sync(&[], &mut ContBarrier::new());
+        }
+    });
+    let id = join_handle.thread().id();
+    JoinHandle { id, result: cell }
+}
+
+#[bridge(name = "join", lib = "(threads (1))")]
+pub fn join(
+    handle: Embedded<JoinHandle>,
+    barrier: &mut ContBarrier,
+) -> Result<Application, Exception> {
+    let curr_id = thread::current().id();
+    if curr_id == handle.id {
+        Err(Exception::error(format!(
+            "thread {curr_id:?} attempted to join itself"
+        )))
+    } else {
+        Ok(barrier.call_cont(Args::pack(handle.result.lock().clone()?)))
+    }
+}
+
+#[bridge(name = "sleep", lib = "(threads (1))")]
+pub fn sleep(ms: u64) -> Result<(), Exception> {
+    thread::sleep(Duration::from_millis(ms));
+    Ok(())
+}
+
+#[bridge(name = "join-handle?", lib = "(threads (1))")]
+pub fn join_handle_pred(obj: Value) -> bool {
+    obj.is_a::<Embedded<JoinHandle>>()
+}

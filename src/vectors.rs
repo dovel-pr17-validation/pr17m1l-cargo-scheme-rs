@@ -1,0 +1,650 @@
+//! Growable mutable vectors.
+
+#[cfg(target_endian = "little")]
+use crate::symbols::Symbol;
+use crate::{
+    DynHasher,
+    exceptions::Exception,
+    fmt::Formatter,
+    gc::Trace,
+    lists::{List, iter_list, slice_to_list},
+    records::{Embeddable, Embedded, Record},
+    registry::bridge,
+    value::Value,
+};
+use indexmap::IndexSet;
+use parking_lot::{
+    MappedRwLockReadGuard, MappedRwLockWriteGuard, RwLock, RwLockReadGuard, RwLockWriteGuard,
+};
+use scheme_rs_macros::rtd;
+use std::{clone::Clone, fmt, hash::Hash, ops::Range, sync::Arc};
+
+#[derive(Trace)]
+#[repr(align(16))]
+pub(crate) struct VectorInner<T: Trace> {
+    /// Inner vector.
+    pub(crate) vec: RwLock<Vec<T>>,
+    /// Whether or not the vector is mutable
+    pub(crate) mutable: bool,
+}
+
+unsafe impl Embeddable for VectorInner<Value> {
+    fn rtd() -> Arc<crate::records::RecordTypeDescriptor>
+    where
+        Self: Sized,
+    {
+        rtd!(ty: VectorInner<Value>, name: "vector", sealed: true, opaque: true)
+    }
+
+    fn fmt(&self, _record: &Record, fmt: &mut crate::fmt::Formatter<'_>) -> fmt::Result {
+        write_vec(self, fmt)
+    }
+
+    fn equal(&self, rhs: &Record) -> bool
+    where
+        Self: Sized,
+    {
+        let Some(rhs) = rhs.cast::<Self>() else {
+            return false;
+        };
+        *self.vec.read() == *rhs.vec.read()
+    }
+
+    fn equal_hash(&self, recursive: &mut IndexSet<Value>, hasher: &mut dyn std::hash::Hasher)
+    where
+        Self: Sized,
+    {
+        let v_read = self.vec.read();
+        hasher.write_usize(v_read.len());
+        for val in v_read.iter() {
+            val.equal_hash(recursive, &mut DynHasher(hasher));
+        }
+    }
+}
+
+/// A vector of values
+#[derive(Clone, Trace)]
+pub struct Vector(pub(crate) Embedded<VectorInner<Value>>);
+
+impl Vector {
+    pub fn immutable(vec: Vec<Value>) -> Self {
+        Self::from(vec)
+    }
+
+    pub fn mutable(vec: Vec<Value>) -> Self {
+        Self(Embedded::new(VectorInner {
+            vec: RwLock::new(vec),
+            mutable: true,
+        }))
+    }
+
+    pub fn get(&self, index: usize) -> Option<Value> {
+        let handle = self.0.vec.read();
+        handle.get(index).cloned()
+    }
+
+    pub fn first(&self) -> Option<Value> {
+        let handle = self.0.vec.read();
+        handle.first().cloned()
+    }
+
+    pub fn last(&self) -> Option<Value> {
+        let handle = self.0.vec.read();
+        handle.last().cloned()
+    }
+
+    // TODO: Add more convenience functions here
+
+    pub fn to_list(&self) -> Value {
+        slice_to_list(&self.0.vec.read())
+    }
+
+    pub fn clone_inner_vec(&self) -> Vec<Value> {
+        self.0.vec.read().clone()
+    }
+
+    pub fn iter(&self) -> impl Iterator<Item = Value> {
+        self.0.vec.read().clone().into_iter()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.0.vec.read().is_empty()
+    }
+}
+
+impl TryFrom<Value> for Vector {
+    type Error = Exception;
+
+    fn try_from(value: Value) -> Result<Self, Self::Error> {
+        Ok(Self((&value).try_into()?))
+    }
+}
+
+impl From<&Value> for Option<Vector> {
+    fn from(value: &Value) -> Self {
+        Some(Vector(value.cast()?))
+    }
+}
+
+impl TryFrom<&Value> for Vector {
+    type Error = Exception;
+
+    fn try_from(value: &Value) -> Result<Self, Self::Error> {
+        Ok(Self(value.try_into()?))
+    }
+}
+
+impl From<Vec<Value>> for Vector {
+    fn from(vec: Vec<Value>) -> Self {
+        Self(Embedded::new(VectorInner {
+            vec: RwLock::new(vec),
+            mutable: false,
+        }))
+    }
+}
+
+impl From<Vec<Value>> for Value {
+    fn from(vec: Vec<Value>) -> Self {
+        Value::from(VectorInner {
+            vec: RwLock::new(vec),
+            mutable: false,
+        })
+    }
+}
+
+impl From<Vector> for Value {
+    fn from(vec: Vector) -> Self {
+        Value::from(vec.0)
+    }
+}
+
+unsafe impl Embeddable for VectorInner<u8> {
+    fn rtd() -> Arc<crate::records::RecordTypeDescriptor>
+    where
+        Self: Sized,
+    {
+        rtd!(ty: VectorInner<u8>, name: "bytevector", sealed: true, opaque: true)
+    }
+
+    fn fmt(&self, _record: &Record, fmt: &mut crate::fmt::Formatter<'_>) -> fmt::Result {
+        write_bytevec(self, fmt)
+    }
+
+    fn equal(&self, rhs: &Record) -> bool
+    where
+        Self: Sized,
+    {
+        let Some(rhs) = rhs.cast::<Self>() else {
+            return false;
+        };
+        *self.vec.read() == *rhs.vec.read()
+    }
+
+    fn equal_hash(&self, _recursive: &mut IndexSet<Value>, hasher: &mut dyn std::hash::Hasher)
+    where
+        Self: Sized,
+    {
+        self.vec.read().hash(&mut DynHasher(hasher))
+    }
+}
+
+/// A vector of bytes
+#[derive(Clone, Trace)]
+pub struct ByteVector(pub(crate) Embedded<VectorInner<u8>>);
+
+impl ByteVector {
+    pub fn immutable(vec: Vec<u8>) -> Self {
+        Self::from(vec)
+    }
+
+    pub fn mutable(vec: Vec<u8>) -> Self {
+        Self(Embedded::new(VectorInner {
+            vec: RwLock::new(vec),
+            mutable: true,
+        }))
+    }
+
+    pub fn as_slice(&self) -> MappedRwLockReadGuard<'_, [u8]> {
+        RwLockReadGuard::map(self.0.vec.read(), |vec| vec.as_slice())
+    }
+
+    pub fn as_mut_slice(&self) -> Result<MappedRwLockWriteGuard<'_, [u8]>, Exception> {
+        if self.0.mutable {
+            Ok(RwLockWriteGuard::map(self.0.vec.write(), |vec| {
+                vec.as_mut_slice()
+            }))
+        } else {
+            Err(Exception::error("bytevector is not mutable"))
+        }
+    }
+
+    pub fn as_mut_vec(&self) -> Result<RwLockWriteGuard<'_, Vec<u8>>, Exception> {
+        if self.0.mutable {
+            Ok(self.0.vec.write())
+        } else {
+            Err(Exception::error("bytevector is not mutable"))
+        }
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.len() == 0
+    }
+
+    pub fn len(&self) -> usize {
+        self.0.vec.read().len()
+    }
+
+    pub fn clear(&self) -> Result<(), Exception> {
+        if self.0.mutable {
+            self.0.vec.write().clear();
+            Ok(())
+        } else {
+            Err(Exception::error("bytevector is not mutable"))
+        }
+    }
+
+    pub fn get(&self, idx: usize) -> Option<u8> {
+        self.0.vec.read().get(idx).copied()
+    }
+}
+
+impl From<Vec<u8>> for ByteVector {
+    fn from(vec: Vec<u8>) -> Self {
+        Self(Embedded::new(VectorInner {
+            vec: RwLock::new(vec),
+            mutable: false,
+        }))
+    }
+}
+
+impl Hash for ByteVector {
+    fn hash<H: std::hash::Hasher>(&self, state: &mut H) {
+        self.0.vec.read().hash(state)
+    }
+}
+
+impl PartialEq<[u8]> for ByteVector {
+    fn eq(&self, rhs: &[u8]) -> bool {
+        *self.0.vec.read() == rhs
+    }
+}
+
+impl PartialEq for ByteVector {
+    fn eq(&self, rhs: &Self) -> bool {
+        *self.0.vec.read() == *rhs.0.vec.read()
+    }
+}
+
+impl TryFrom<Value> for ByteVector {
+    type Error = Exception;
+
+    fn try_from(value: Value) -> Result<Self, Self::Error> {
+        Ok(Self((&value).try_into()?))
+    }
+}
+
+impl From<&Value> for Option<ByteVector> {
+    fn from(value: &Value) -> Self {
+        Some(ByteVector(value.cast()?))
+    }
+}
+
+impl TryFrom<&Value> for ByteVector {
+    type Error = Exception;
+
+    fn try_from(value: &Value) -> Result<Self, Self::Error> {
+        Ok(Self(value.try_into()?))
+    }
+}
+
+impl From<Vec<u8>> for Value {
+    fn from(value: Vec<u8>) -> Self {
+        Value::from(ByteVector::from(value))
+    }
+}
+
+impl From<ByteVector> for Value {
+    fn from(vec: ByteVector) -> Self {
+        Value::from(vec.0)
+    }
+}
+
+pub(crate) fn write_vec(v: &VectorInner<Value>, f: &mut Formatter<'_>) -> Result<(), fmt::Error> {
+    write!(f, "#(")?;
+
+    let values = v.vec.read();
+    for (i, value) in values.iter().enumerate() {
+        if i > 0 {
+            write!(f, " ")?;
+        }
+        f.fmt_value(value)?;
+    }
+
+    write!(f, ")")
+}
+
+pub(crate) fn write_bytevec(v: &VectorInner<u8>, f: &mut Formatter<'_>) -> Result<(), fmt::Error> {
+    write!(f, "#vu8(")?;
+
+    let bytes = v.vec.read();
+    for (i, byte) in bytes.iter().enumerate() {
+        if i > 0 {
+            write!(f, " ")?;
+        }
+        write!(f, "{byte}")?;
+    }
+
+    write!(f, ")")
+}
+
+fn try_make_range(start: usize, end: usize) -> Result<Range<usize>, Exception> {
+    if end < start {
+        Err(Exception::error(format!(
+            "range end {end} is less than start {start}",
+        )))
+    } else {
+        Ok(start..end)
+    }
+}
+
+trait Indexer {
+    type Collection: TryFrom<Value, Error = Exception>;
+
+    fn get_len(_: &Self::Collection) -> usize;
+
+    fn get_range(_: &Self::Collection, _: Range<usize>) -> Self::Collection;
+
+    fn index(
+        from: &Value,
+        start: Option<usize>,
+        end: Option<usize>,
+    ) -> Result<Self::Collection, Exception> {
+        let collection = Self::Collection::try_from(from.clone())?;
+        let len = Self::get_len(&collection);
+
+        let start = start.unwrap_or(0);
+        let end = end.unwrap_or(len);
+
+        let range = try_make_range(start, end)?;
+        if range.end > len {
+            return Err(Exception::invalid_range(range, len));
+        }
+
+        Ok(Self::get_range(&collection, range))
+    }
+}
+
+struct VectorIndexer;
+
+impl Indexer for VectorIndexer {
+    // type Collection = Gc<RwLock<AlignedVector<Value>>>;
+    type Collection = Vector;
+
+    fn get_len(vec: &Self::Collection) -> usize {
+        vec.0.vec.read().len()
+    }
+
+    fn get_range(vec: &Self::Collection, range: Range<usize>) -> Self::Collection {
+        let subvec: Vec<Value> = vec
+            .0
+            .vec
+            .read()
+            .iter()
+            .skip(range.start)
+            .take(range.end - range.start)
+            .cloned()
+            .collect();
+        Vector(Embedded::new(VectorInner {
+            vec: RwLock::new(subvec),
+            mutable: true,
+        }))
+    }
+}
+
+#[bridge(name = "vector?", lib = "(rnrs base builtins (6))")]
+pub fn vector_pred(arg: Value) -> bool {
+    arg.is_a::<Vector>()
+}
+
+#[bridge(name = "make-vector", lib = "(rnrs base builtins (6))")]
+pub fn make_vector(n: usize, with: Option<Value>) -> Result<Vector, Exception> {
+    let with = with.unwrap_or_else(Value::null);
+    Ok(Vector::mutable(
+        (0..n).map(|_| with.clone()).collect::<Vec<_>>(),
+    ))
+}
+
+#[bridge(name = "vector", lib = "(rnrs base builtins (6))")]
+pub fn vector(#[rest_args] args: Value) -> Vector {
+    Vector::mutable(iter_list(&args).collect())
+}
+
+#[bridge(name = "vector-ref", lib = "(rnrs base builtins (6))")]
+pub fn vector_ref(vec: Vector, index: usize) -> Result<Value, Exception> {
+    let vec_read = vec.0.vec.read();
+
+    Ok(vec_read
+        .get(index)
+        .ok_or_else(|| Exception::invalid_index(index, vec_read.len()))?
+        .clone())
+}
+
+#[bridge(name = "vector-length", lib = "(rnrs base builtins (6))")]
+pub fn vector_length(vec: Vector) -> usize {
+    vec.0.vec.read().len()
+}
+
+#[bridge(name = "bytevector-length", lib = "(rnrs base builtins (6))")]
+pub fn bytevector_len(vec: ByteVector) -> usize {
+    vec.0.vec.read().len()
+}
+
+#[bridge(name = "vector-set!", lib = "(rnrs base builtins (6))")]
+pub fn vector_set_bang(vec: Vector, index: usize, with: Value) -> Result<(), Exception> {
+    if !vec.0.mutable {
+        return Err(Exception::error("vector is immutable"));
+    }
+
+    let mut vec_write = vec.0.vec.write();
+    let vec_len = vec_write.len();
+
+    *vec_write
+        .get_mut(index)
+        .ok_or_else(|| Exception::invalid_index(index, vec_len))? = with.clone();
+
+    Ok(())
+}
+
+#[bridge(name = "vector->list", lib = "(rnrs base builtins (6))")]
+pub fn vector_to_list(
+    from: Value,
+    start: Option<usize>,
+    end: Option<usize>,
+) -> Result<Value, Exception> {
+    let vec = VectorIndexer::index(&from, start, end)?;
+    let vec_read = vec.0.vec.read();
+    Ok(slice_to_list(&vec_read))
+}
+
+#[bridge(name = "vector->string", lib = "(rnrs base builtins (6))")]
+pub fn vector_to_string(
+    from: Value,
+    start: Option<usize>,
+    end: Option<usize>,
+) -> Result<String, Exception> {
+    let vec = VectorIndexer::index(&from, start, end)?;
+    let vec_read = vec.0.vec.read();
+    vec_read
+        .iter()
+        .cloned()
+        .map(<Value as TryInto<char>>::try_into)
+        .collect::<Result<String, _>>()
+}
+
+#[bridge(name = "vector-copy", lib = "(rnrs base builtins (6))")]
+pub fn vector_copy(
+    from: Value,
+    start: Option<usize>,
+    end: Option<usize>,
+) -> Result<Value, Exception> {
+    Ok(Value::from(VectorIndexer::index(&from, start, end)?))
+}
+
+#[bridge(name = "vector-copy!", lib = "(rnrs base builtins (6))")]
+pub fn vector_copy_to(
+    to: Vector,
+    at: usize,
+    from: Value,
+    start: Option<usize>,
+    end: Option<usize>,
+) -> Result<(), Exception> {
+    let mut to = to.0.vec.write();
+
+    if at >= to.len() {
+        return Err(Exception::invalid_index(at, to.len()));
+    }
+
+    let copies = VectorIndexer::index(&from, start, end)?;
+    let copies = copies.0.vec.read();
+    if copies.len() + at >= to.len() {
+        return Err(Exception::invalid_range(at..at + copies.len(), to.len()));
+    }
+
+    copies
+        .iter()
+        .enumerate()
+        .map(|(i, copy)| (i + at, copy))
+        .for_each(|(i, copy)| {
+            if let Some(i) = to.get_mut(i) {
+                *i = copy.clone();
+            }
+        });
+
+    Ok(())
+}
+
+#[bridge(name = "vector-append", lib = "(rnrs base builtins (6))")]
+pub fn vector_append(#[rest_args] args: Value) -> Result<Value, Exception> {
+    if args.is_null() {
+        return Err(Exception::wrong_num_of_var_args(1..usize::MAX, 0));
+    }
+
+    let mut appended = Vec::new();
+    for arg in iter_list(&args) {
+        let vec: Vector = arg.try_into()?;
+        appended.extend(vec.0.vec.read().iter().cloned());
+    }
+    Ok(Value::from(appended))
+}
+
+#[bridge(name = "vector-fill!", lib = "(rnrs base builtins (6))")]
+pub fn vector_fill(
+    vector: Vector,
+    with: Value,
+    start: Value,
+    end: Option<usize>,
+) -> Result<(), Exception> {
+    let mut vector = vector.0.vec.write();
+
+    let start: usize = start.clone().try_into()?;
+    let end = match end {
+        Some(end) => end,
+        None => vector.len(),
+    };
+
+    let range = try_make_range(start, end)?;
+    if range.end > vector.len() {
+        return Err(Exception::invalid_range(range, vector.len()));
+    }
+
+    range.for_each(|i| {
+        if let Some(slot) = vector.get_mut(i) {
+            *slot = with.clone()
+        }
+    });
+
+    Ok(())
+}
+
+#[bridge(name = "native-endianness", lib = "(rnrs bytevectors (6))")]
+pub fn native_endianness() -> Symbol {
+    #[cfg(target_endian = "little")]
+    {
+        Symbol::intern("little")
+    }
+    #[cfg(target_endian = "big")]
+    {
+        Symbol::intern("big")
+    }
+}
+
+#[bridge(name = "bytevector?", lib = "(rnrs bytevectors (6))")]
+pub fn bytevector_pred(arg: Value) -> bool {
+    arg.is_a::<Embedded<VectorInner<u8>>>()
+}
+
+#[bridge(name = "make-bytevector", lib = "(rnrs bytevectors (6))")]
+pub fn make_bytevector(k: usize, fill: Option<u8>) -> Result<ByteVector, Exception> {
+    let fill = fill.unwrap_or(0);
+    Ok(ByteVector::mutable(vec![fill; k]))
+}
+
+#[bridge(name = "bytevector-length", lib = "(rnrs bytevectors (6))")]
+pub fn bytevector_length(bytevector: ByteVector) -> usize {
+    bytevector.len()
+}
+
+#[bridge(name = "bytevector=?", lib = "(rnrs bytevectors (6))")]
+pub fn bytevector_equal_pred(lhs: ByteVector, rhs: ByteVector) -> bool {
+    lhs == rhs
+}
+
+#[bridge(name = "bytevector-u8-ref", lib = "(rnrs bytevectors (6))")]
+pub fn bytevector_u8_ref(bytevector: ByteVector, k: usize) -> Result<u8, Exception> {
+    Ok(bytevector
+        .get(k)
+        .ok_or_else(|| Exception::invalid_index(k, bytevector.len()))?)
+}
+
+#[bridge(name = "bytevector-u8-set!", lib = "(rnrs bytevectors (6))")]
+pub fn bytevector_u8_set(bytevector: ByteVector, k: usize, octet: u8) -> Result<(), Exception> {
+    let mut slice = bytevector.as_mut_slice()?;
+    let len = slice.len();
+    *slice
+        .get_mut(k)
+        .ok_or_else(|| Exception::invalid_index(k, len))? = octet;
+    Ok(())
+}
+
+#[bridge(name = "u8-list->bytevector", lib = "(rnrs bytevectors (6))")]
+pub fn u8_list_to_bytevector(list: List) -> Result<ByteVector, Exception> {
+    Ok(ByteVector::mutable(
+        list.into_iter()
+            .map(u8::try_from)
+            .collect::<Result<Vec<_>, _>>()?,
+    ))
+}
+
+#[bridge(name = "bytevector-push!", lib = "(rnrs bytevectors (6))")]
+pub fn bytevector_push(bytevector: ByteVector, byte: u8) -> Result<(), Exception> {
+    bytevector.as_mut_vec()?.push(byte);
+    Ok(())
+}
+
+#[bridge(name = "bytevector-insert!", lib = "(rnrs bytevectors (6))")]
+pub fn bytevector_insert(bytevector: ByteVector, idx: usize, byte: u8) -> Result<(), Exception> {
+    let mut bv = bytevector.as_mut_vec()?;
+    if idx > bv.len() {
+        return Err(Exception::invalid_index(idx, bv.len()));
+    } else {
+        bv.insert(idx, byte);
+    }
+    Ok(())
+}
+
+#[bridge(name = "bytevector-take!", lib = "(rnrs bytevectors (6))")]
+pub fn bytevector_take(bytevector: ByteVector) -> Result<ByteVector, Exception> {
+    Ok(ByteVector::mutable(std::mem::take(
+        &mut *bytevector.as_mut_vec()?,
+    )))
+}
