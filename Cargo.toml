@@ -29,7 +29,7 @@ parking_lot = "0.12.5"
 rand = { version = "0.9", features = ["thread_rng"] }
 rust-embed = { version = "8", features = ["debug-embed"] }
 rustc-hash = "2.1"
-rustyline = { version = "17", features = ["derive"] }
+rustyline = { version = "19.0.0", features = ["derive"] }
 scheme-rs-gc = { version = "0.1.0", path = "scheme-rs-gc" }
 scheme-rs-macros = { version = "0.2.0", path = "proc-macros" }
 serde = { version = "1", features = ["derive"], optional = true }
